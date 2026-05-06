@@ -106,8 +106,8 @@ pub fn build_reply_target_binding(
     let reply = reply_message_id
         .map(|r| r.to_string())
         .unwrap_or_else(|| "_".to_string());
-    ReplyTargetBindingRef::new(format!("tg:{chat_id}:{topic}:{reply}"))
-        .expect("constructed reply target is well-formed")
+    let formatted = format!("tg:{chat_id}:{topic}:{reply}");
+    ReplyTargetBindingRef::new(formatted).expect("constructed reply target is well-formed") // safety: format produces ASCII digits/':'/'-'/'_' within bounded-ref length
 }
 
 /// Render a `FinalReplyView` into a `sendMessage` egress request.
@@ -136,13 +136,13 @@ pub fn render_final_reply(
         );
     }
     let body_bytes =
-        serde_json::to_vec(&serde_json::Value::Object(body)).expect("body serializes to JSON");
+        serde_json::to_vec(&serde_json::Value::Object(body)).expect("body serializes to JSON"); // safety: body is a serde_json::Value::Object built from owned Strings/Numbers; serialization cannot fail
 
     let mut headers = BTreeMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
 
     Ok(EgressRequest {
-        host: DeclaredEgressHost::new(TELEGRAM_API_HOST).expect("static host valid"),
+        host: DeclaredEgressHost::new(TELEGRAM_API_HOST).expect("static host valid"), // safety: TELEGRAM_API_HOST is a compile-time const that satisfies the host validator
         method: "POST".into(),
         path: "/sendMessage".into(),
         headers,
@@ -175,13 +175,13 @@ pub fn render_progress_typing(
         );
     }
     let body_bytes =
-        serde_json::to_vec(&serde_json::Value::Object(body)).expect("progress body serializes");
+        serde_json::to_vec(&serde_json::Value::Object(body)).expect("progress body serializes"); // safety: progress body is a serde_json::Value::Object built from owned scalars; serialization cannot fail
 
     let mut headers = BTreeMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
 
     Ok(Some(EgressRequest {
-        host: DeclaredEgressHost::new(TELEGRAM_API_HOST).expect("static host valid"),
+        host: DeclaredEgressHost::new(TELEGRAM_API_HOST).expect("static host valid"), // safety: TELEGRAM_API_HOST is a compile-time const that satisfies the host validator
         method: "POST".into(),
         path: "/sendChatAction".into(),
         headers,

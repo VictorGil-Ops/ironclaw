@@ -5,7 +5,7 @@ use ironclaw_product_adapters::{
     AdapterInstallationId, DeclaredEgressHost, EgressCredentialHandle, ProductAdapter,
     ProductAdapterCapabilities, ProductAdapterError, ProductAdapterId, ProductCapabilityFlag,
     ProductInboundEnvelope, ProductOutboundEnvelope, ProductOutboundPayload, ProductSurfaceKind,
-    ProtocolAuthEvidence, ProtocolHttpEgress, redaction::RedactedString,
+    ProtocolAuthEvidence, ProtocolHttpEgress, ProtocolHttpEgressError, redaction::RedactedString,
 };
 
 use crate::payload::{
@@ -52,7 +52,7 @@ impl TelegramV2Adapter {
 
 /// Egress hosts that any Telegram v2 installation may target.
 pub fn telegram_declared_egress_hosts() -> Vec<DeclaredEgressHost> {
-    vec![DeclaredEgressHost::new(TELEGRAM_API_HOST).expect("static host valid")]
+    vec![DeclaredEgressHost::new(TELEGRAM_API_HOST).expect("static host valid")] // safety: compile-time const "api.telegram.org" satisfies DeclaredEgressHost validator
 }
 
 #[async_trait]
@@ -166,19 +166,38 @@ impl ProductAdapter for TelegramV2Adapter {
             }
         };
 
-        let response =
-            egress
-                .send(request)
-                .await
-                .map_err(|err| ProductAdapterError::EgressDenied {
-                    reason: err.to_string(),
-                })?;
+        let response = egress.send(request).await.map_err(map_egress_error)?;
         if !(200..300).contains(&response.status) {
-            return Err(ProductAdapterError::EgressDenied {
-                reason: format!("telegram bot api returned status {}", response.status),
-            });
+            let reason = format!("telegram bot api returned status {}", response.status);
+            // Group transient HTTP outcomes (5xx, 429) into the retryable
+            // bucket so the host glue can re-deliver. 4xx (except 429) is
+            // a deterministic policy-denied result and should NOT be
+            // retried.
+            if response.status >= 500 || response.status == 429 {
+                return Err(ProductAdapterError::WorkflowTransient { reason });
+            }
+            return Err(ProductAdapterError::EgressDenied { reason });
         }
         Ok(())
+    }
+}
+
+/// Map a `ProtocolHttpEgressError` to either a retryable
+/// `WorkflowTransient` or a non-retryable `EgressDenied`. Network /
+/// timeout / leak-detector failures are treated as transient.
+fn map_egress_error(err: ProtocolHttpEgressError) -> ProductAdapterError {
+    match err {
+        ProtocolHttpEgressError::Timeout
+        | ProtocolHttpEgressError::Network(_)
+        | ProtocolHttpEgressError::LeakDetected => ProductAdapterError::WorkflowTransient {
+            reason: err.to_string(),
+        },
+        ProtocolHttpEgressError::UndeclaredHost { .. }
+        | ProtocolHttpEgressError::UnknownCredentialHandle { .. }
+        | ProtocolHttpEgressError::UnauthorizedCredentialHandle { .. }
+        | ProtocolHttpEgressError::PolicyDenied { .. } => ProductAdapterError::EgressDenied {
+            reason: err.to_string(),
+        },
     }
 }
 

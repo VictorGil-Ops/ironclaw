@@ -195,10 +195,12 @@ fn sample_envelope(event_id: &str) -> ProductInboundEnvelope {
             Some("msg-100"),
         )
         .expect("valid"),
-        auth_evidence: mark_shared_secret_header_verified(
-            "X-Telegram-Bot-Api-Secret-Token",
-            "telegram_install_alpha",
-        ),
+        auth_claim: ironclaw_product_adapters::auth::VerifiedAuthClaim {
+            requirement: ironclaw_product_adapters::AuthRequirement::SharedSecretHeader {
+                header_name: "X-Telegram-Bot-Api-Secret-Token".into(),
+            },
+            subject: "telegram_install_alpha".into(),
+        },
         received_at: chrono::Utc::now(),
         payload: ProductInboundPayload::UserMessage(
             UserMessagePayload::new("hello", vec![], ProductTriggerReason::DirectChat)

@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use ironclaw_turns::TurnRunId;
 use serde::{Deserialize, Serialize};
 
-use crate::auth::ProtocolAuthEvidence;
+use crate::auth::VerifiedAuthClaim;
 use crate::external::{
     ExternalActorRef, ExternalConversationRef, ExternalEventId, ProductAttachmentDescriptor,
 };
@@ -109,7 +109,13 @@ pub struct ProductInboundEnvelope {
     pub external_event_id: ExternalEventId,
     pub external_actor_ref: ExternalActorRef,
     pub external_conversation_ref: ExternalConversationRef,
-    pub auth_evidence: ProtocolAuthEvidence,
+    /// Sanitized verified-claim attestation. Envelopes only exist after
+    /// the host has produced a `ProtocolAuthEvidence::Verified`; we carry
+    /// only the [`VerifiedAuthClaim`] payload here so the envelope
+    /// round-trips cleanly through audit logs and projections without
+    /// re-opening the forgery loophole that lived on the full
+    /// `ProtocolAuthEvidence` enum.
+    pub auth_claim: VerifiedAuthClaim,
     pub received_at: DateTime<Utc>,
     pub payload: ProductInboundPayload,
 }
@@ -182,7 +188,6 @@ impl ProductInboundAck {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::mark_shared_secret_header_verified;
     use crate::external::{ExternalActorRef, ExternalConversationRef, ExternalEventId};
     use crate::identity::{AdapterInstallationId, ProductAdapterId};
 
@@ -199,10 +204,12 @@ mod tests {
                 Some("msg-100"),
             )
             .expect("valid"),
-            auth_evidence: mark_shared_secret_header_verified(
-                "X-Telegram-Bot-Api-Secret-Token",
-                "telegram_install_alpha",
-            ),
+            auth_claim: VerifiedAuthClaim {
+                requirement: crate::AuthRequirement::SharedSecretHeader {
+                    header_name: "X-Telegram-Bot-Api-Secret-Token".into(),
+                },
+                subject: "telegram_install_alpha".into(),
+            },
             received_at: Utc::now(),
             payload,
         }

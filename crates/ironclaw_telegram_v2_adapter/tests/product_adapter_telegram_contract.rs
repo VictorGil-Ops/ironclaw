@@ -367,7 +367,12 @@ async fn ac6_workflow_returns_each_durable_outcome_kind() {
                 Some("1"),
             )
             .unwrap(),
-            auth_evidence: evidence(),
+            auth_claim: ironclaw_product_adapters::auth::VerifiedAuthClaim {
+                requirement: ironclaw_product_adapters::AuthRequirement::SharedSecretHeader {
+                    header_name: "X-Telegram-Bot-Api-Secret-Token".into(),
+                },
+                subject: TELEGRAM_INSTALLATION_SUBJECT.into(),
+            },
             received_at: chrono::Utc::now(),
             payload: ProductInboundPayload::UserMessage(
                 ironclaw_product_adapters::UserMessagePayload::new(
@@ -816,10 +821,16 @@ async fn ac14_delivery_failure_records_status_separately() {
     match result {
         Ok(_) => panic!("expected delivery to fail at the protocol layer"),
         Err(err) => {
-            // Production glue surfaces this as a FailedRetryable status; the
-            // adapter signals via Err so the host-glue layer can decide
-            // retry/dead-letter behavior.
-            assert!(matches!(err, ProductAdapterError::EgressDenied { .. }));
+            // 5xx is classified as retryable so the host-glue layer can
+            // re-deliver. The adapter surfaces it as
+            // `WorkflowTransient`; the egress sink records a separate
+            // `FailedRetryable` status that does not mutate canonical
+            // workflow state.
+            assert!(
+                matches!(err, ProductAdapterError::WorkflowTransient { .. }),
+                "5xx must be classified retryable; got {err:?}"
+            );
+            assert!(err.is_retryable());
             sink.record(DeliveryStatus::FailedRetryable {
                 attempt_id,
                 target: target_for_status,
@@ -874,6 +885,121 @@ async fn ac14_delivery_failure_does_not_mutate_canonical_workflow_state() {
 
     let envelopes_after_outbound = workflow.accepted_envelopes();
     assert_eq!(envelopes_after_inbound, envelopes_after_outbound);
+}
+
+#[tokio::test]
+async fn ac14_egress_retryable_classification_matrix() {
+    use ironclaw_product_adapters::redaction::RedactedString;
+
+    // Each row drives `render_outbound` against a programmed egress
+    // response or error and asserts the produced ProductAdapterError's
+    // retryability classification.
+    type CaseResponseFn =
+        Box<dyn Fn() -> Result<EgressResponse, ProtocolHttpEgressError> + Send + Sync>;
+    let cases: Vec<(&'static str, CaseResponseFn, bool)> = vec![
+        (
+            "timeout -> retryable",
+            Box::new(|| Err(ProtocolHttpEgressError::Timeout)),
+            true,
+        ),
+        (
+            "network failure -> retryable",
+            Box::new(|| {
+                Err(ProtocolHttpEgressError::Network(RedactedString::new(
+                    "connection reset",
+                )))
+            }),
+            true,
+        ),
+        (
+            "leak detected -> retryable (operator visibility)",
+            Box::new(|| Err(ProtocolHttpEgressError::LeakDetected)),
+            true,
+        ),
+        (
+            "policy denied -> NOT retryable",
+            Box::new(|| {
+                Err(ProtocolHttpEgressError::PolicyDenied {
+                    reason: "host scope".into(),
+                })
+            }),
+            false,
+        ),
+        (
+            "503 -> retryable",
+            Box::new(|| {
+                Ok(EgressResponse {
+                    status: 503,
+                    headers: Default::default(),
+                    body: vec![],
+                })
+            }),
+            true,
+        ),
+        (
+            "429 -> retryable",
+            Box::new(|| {
+                Ok(EgressResponse {
+                    status: 429,
+                    headers: Default::default(),
+                    body: vec![],
+                })
+            }),
+            true,
+        ),
+        (
+            "400 -> NOT retryable",
+            Box::new(|| {
+                Ok(EgressResponse {
+                    status: 400,
+                    headers: Default::default(),
+                    body: vec![],
+                })
+            }),
+            false,
+        ),
+        (
+            "404 -> NOT retryable",
+            Box::new(|| {
+                Ok(EgressResponse {
+                    status: 404,
+                    headers: Default::default(),
+                    body: vec![],
+                })
+            }),
+            false,
+        ),
+    ];
+
+    for (name, mk_response, expected_retryable) in cases {
+        let adapter = TelegramV2Adapter::new(config());
+        let egress = FakeProtocolHttpEgress::new(["api.telegram.org".to_string()]);
+        egress.allow_credential_handle(TELEGRAM_BOT_TOKEN_HANDLE);
+        egress.program_response("api.telegram.org", mk_response());
+        let target =
+            ironclaw_telegram_v2_adapter::render::build_reply_target_binding(-42, None, Some(50));
+        let envelope = ProductOutboundEnvelope {
+            adapter_id: adapter.adapter_id().clone(),
+            installation_id: adapter.installation_id().clone(),
+            target,
+            projection_cursor: None,
+            payload: ProductOutboundPayload::FinalReply(FinalReplyView {
+                turn_run_id: TurnRunId::new(),
+                text: "hi".into(),
+                generated_at: chrono::Utc::now(),
+            }),
+            delivery_attempt_id: uuid::Uuid::new_v4(),
+        };
+        let err = adapter
+            .render_outbound(envelope, &egress)
+            .await
+            .expect_err(name);
+        assert_eq!(
+            err.is_retryable(),
+            expected_retryable,
+            "{name}: expected is_retryable={expected_retryable}, got err={err:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -73,9 +73,12 @@ pub fn parse_telegram_update(
     installation_id: &AdapterInstallationId,
     group_trigger_policy: &GroupTriggerPolicy,
 ) -> Result<TelegramParsedInbound, PayloadParseError> {
-    if !auth_evidence.is_verified() {
-        return Err(PayloadParseError::UnauthenticatedPayload);
-    }
+    let auth_claim = match auth_evidence {
+        ProtocolAuthEvidence::Verified { claim, .. } => claim,
+        ProtocolAuthEvidence::Failed { .. } => {
+            return Err(PayloadParseError::UnauthenticatedPayload);
+        }
+    };
 
     let update: TelegramUpdate =
         serde_json::from_slice(raw_payload).map_err(|err| PayloadParseError::InvalidJson {
@@ -113,7 +116,7 @@ pub fn parse_telegram_update(
         external_event_id: event_id,
         external_actor_ref: actor_ref,
         external_conversation_ref: conversation_ref,
-        auth_evidence,
+        auth_claim,
         received_at,
         payload,
     };
@@ -261,27 +264,41 @@ fn recognized_bot_command(message: &TelegramMessage, policy: &GroupTriggerPolicy
 /// Slice from a UTF-16 offset to the end of the string.
 fn slice_text_to_end(text: &str, offset: u32) -> Option<&str> {
     let start = offset as usize;
+    // Empty string + offset 0 must yield an empty slice rather than None
+    // — a zero-length entity at the start of an empty mention/command
+    // payload is well-formed, even if degenerate.
+    if start == 0 {
+        return Some(text);
+    }
     let mut units = 0usize;
     for (byte_idx, ch) in text.char_indices() {
-        if units == start {
-            return Some(&text[byte_idx..]);
-        }
         units += ch.len_utf16();
+        if units == start {
+            // Offset reached: slice begins at the byte after this char.
+            let next = byte_idx + ch.len_utf8();
+            return text.get(next..);
+        }
     }
     if units == start { Some("") } else { None }
 }
 
 fn slice_text_by_offset(text: &str, offset: u32, length: u32) -> Option<&str> {
     let start = offset as usize;
-    let end = start + length as usize;
-    let mut byte_start = None;
-    let mut byte_end = None;
+    let end = start.checked_add(length as usize)?;
+    // Initialize byte_start to Some(0) when offset is 0 — without this,
+    // the loop never sets byte_start for the start-of-string case (and an
+    // empty string never enters the loop body at all). This made
+    // slice_text_by_offset(_, 0, 0) return None instead of Some(""), which
+    // is wrong for zero-length entities at the start of the text. Same
+    // shape applies when start lies past the text and length is 0.
+    let mut byte_start = if start == 0 { Some(0) } else { None };
+    let mut byte_end = if end == 0 { Some(0) } else { None };
     let mut units = 0usize;
     for (byte_idx, ch) in text.char_indices() {
-        if units == start {
+        if units == start && byte_start.is_none() {
             byte_start = Some(byte_idx);
         }
-        if units == end {
+        if units == end && byte_end.is_none() {
             byte_end = Some(byte_idx);
             break;
         }
@@ -290,9 +307,69 @@ fn slice_text_by_offset(text: &str, offset: u32, length: u32) -> Option<&str> {
     if byte_end.is_none() && units == end {
         byte_end = Some(text.len());
     }
+    if byte_start.is_none() && units == start {
+        byte_start = Some(text.len());
+    }
     let start = byte_start?;
     let end = byte_end?;
     text.get(start..end)
+}
+
+#[cfg(test)]
+mod slice_tests {
+    use super::*;
+
+    #[test]
+    fn zero_length_slice_at_offset_zero_returns_empty() {
+        assert_eq!(slice_text_by_offset("", 0, 0), Some(""));
+        assert_eq!(slice_text_by_offset("hello", 0, 0), Some(""));
+    }
+
+    #[test]
+    fn full_string_slice() {
+        assert_eq!(slice_text_by_offset("hello", 0, 5), Some("hello"));
+    }
+
+    #[test]
+    fn slice_at_end_zero_length() {
+        assert_eq!(slice_text_by_offset("hello", 5, 0), Some(""));
+    }
+
+    #[test]
+    fn slice_past_end_returns_none() {
+        assert_eq!(slice_text_by_offset("hello", 6, 0), None);
+        assert_eq!(slice_text_by_offset("hello", 5, 1), None);
+    }
+
+    #[test]
+    fn multibyte_slice_respects_utf16_offsets() {
+        // "🦀" is 1 char, 2 UTF-16 code units, 4 bytes in UTF-8.
+        let text = "ab🦀cd";
+        // Slice "🦀" => offset 2 (after "ab"), length 2 (one surrogate pair).
+        assert_eq!(slice_text_by_offset(text, 2, 2), Some("🦀"));
+        // Slice the whole string.
+        assert_eq!(slice_text_by_offset(text, 0, 6), Some("ab🦀cd"));
+    }
+
+    #[test]
+    fn slice_to_end_handles_empty_text() {
+        assert_eq!(slice_text_to_end("", 0), Some(""));
+    }
+
+    #[test]
+    fn slice_to_end_at_string_end() {
+        assert_eq!(slice_text_to_end("hello", 5), Some(""));
+    }
+
+    #[test]
+    fn slice_to_end_past_string_returns_none() {
+        assert_eq!(slice_text_to_end("hello", 6), None);
+    }
+
+    #[test]
+    fn slice_to_end_basic() {
+        assert_eq!(slice_text_to_end("hello world", 6), Some("world"));
+    }
 }
 
 fn build_event_id(

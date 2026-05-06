@@ -9,8 +9,19 @@
 //! protocol verification must do so through helpers on this module
 //! (`mark_signature_verified`, `mark_token_verified`, `mark_session_verified`)
 //! which take the seal internally.
+//!
+//! ## Serde forgery resistance
+//!
+//! `ProtocolAuthEvidence::Verified` MUST NOT be constructible from an
+//! untrusted wire. The custom `Deserialize` impl in this module accepts
+//! `Failed` only and rejects every `Verified` payload with an error. This
+//! closes the `#[serde(default)]` re-mint loophole that an earlier draft
+//! exposed: a `Verified` evidence in memory is now provably the result of
+//! a host-side `mark_*_verified` call, not a JSON deserialization.
 
-use serde::{Deserialize, Serialize};
+use serde::de::{self, Visitor};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::fmt;
 use thiserror::Error;
 
 use crate::redaction::RedactedString;
@@ -60,22 +71,111 @@ pub struct VerifiedAuthClaim {
 }
 
 /// Outcome of host-side protocol authentication.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Note: `Verified` is intentionally **not** automatically deserializable.
+/// The custom `Deserialize` impl below rejects any wire payload that
+/// claims to be `Verified` — the only path to a `Verified` value is via
+/// the public `mark_*_verified` helpers in this module, which run inside
+/// the trusted host. Wire payloads carrying authentication outcomes may
+/// only encode `Failed`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProtocolAuthEvidence {
-    /// Host verified the protocol authentication. Constructible only inside
-    /// this crate via `host_verified`.
+    /// Host verified the protocol authentication. Constructible only
+    /// inside this crate via `host_verified`. Cannot be reached through
+    /// `Deserialize`.
     Verified {
         claim: VerifiedAuthClaim,
-        // Must be present to prevent forgery. Serde skips this field on the
-        // wire; `Deserialize` re-mints it through `HostAuthSeal::host_only`,
-        // which is reachable only from this crate's deserializer impl. WASM
-        // components/external adapters never deserialize a `Verified` value
-        // — they consume it through the host's API instead.
-        #[serde(skip, default = "HostAuthSeal::host_only")]
+        // The seal field is `skip`'d on the *serialize* side too — it
+        // carries no payload, only type-system authority. This keeps the
+        // wire shape `{"kind":"verified","claim":...}` symmetric with the
+        // accepted-failure shape, so the rejection error in `Deserialize`
+        // is unambiguous: any inbound `verified` payload is forged.
+        #[serde(skip)]
         seal: HostAuthSeal,
     },
-    /// Host could not verify; classification is structured.
+    /// Host could not verify; classification is structured. This is the
+    /// ONLY variant accepted by the custom `Deserialize` impl below.
     Failed { failure: ProtocolAuthFailure },
+}
+
+impl<'de> Deserialize<'de> for ProtocolAuthEvidence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Wire shape: `{"kind":"failed","failure":{...}}`. Any other
+        // `kind` (in particular `"verified"`) is rejected outright.
+        struct EvidenceVisitor;
+
+        impl<'de> Visitor<'de> for EvidenceVisitor {
+            type Value = ProtocolAuthEvidence;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(
+                    "a ProtocolAuthEvidence::Failed wire envelope; \
+                     Verified outcomes must be minted by the host, not \
+                     deserialized from untrusted input",
+                )
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: de::MapAccess<'de>,
+            {
+                let mut kind: Option<String> = None;
+                let mut failure: Option<ProtocolAuthFailure> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "kind" => {
+                            if kind.is_some() {
+                                return Err(de::Error::duplicate_field("kind"));
+                            }
+                            kind = Some(map.next_value()?);
+                        }
+                        "failure" => {
+                            if failure.is_some() {
+                                return Err(de::Error::duplicate_field("failure"));
+                            }
+                            failure = Some(map.next_value()?);
+                        }
+                        // Reject any unexpected key. In particular this
+                        // catches `claim` and `seal` payloads aimed at
+                        // forging a `Verified` value.
+                        other => {
+                            return Err(de::Error::unknown_field(other, &["kind", "failure"]));
+                        }
+                    }
+                }
+                let kind = kind.ok_or_else(|| de::Error::missing_field("kind"))?;
+                if kind != "failed" {
+                    return Err(de::Error::custom(format!(
+                        "ProtocolAuthEvidence wire payload kind={kind:?} is not accepted; \
+                         only `failed` may cross trust boundaries — `verified` outcomes are \
+                         minted by the host"
+                    )));
+                }
+                let failure = failure.ok_or_else(|| de::Error::missing_field("failure"))?;
+                Ok(ProtocolAuthEvidence::Failed { failure })
+            }
+        }
+
+        deserializer.deserialize_map(EvidenceVisitor)
+    }
+}
+
+// `HostAuthSeal` participates in `Serialize` only as a no-op skipped
+// field. Provide an explicit `Serialize` impl so the type can be embedded
+// where the parent uses `#[serde(skip)]`; we deliberately do not provide
+// `Deserialize` because the seal must never be reconstructed from a wire
+// payload.
+impl Serialize for HostAuthSeal {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_unit()
+    }
 }
 
 impl ProtocolAuthEvidence {
@@ -206,18 +306,77 @@ mod tests {
     }
 
     #[test]
-    fn verified_evidence_serde_round_trip() {
-        // The seal field is `#[serde(skip)]`; re-deserialization re-mints
-        // a fresh seal via `HostAuthSeal::host_only` (private constructor),
-        // so an attacker cannot smuggle a fake `Verified` over the wire if
-        // the receiving system trusts only crate-internal verification —
-        // but they CAN obtain a `Verified` value in memory through serde
-        // alone. Adapters must therefore never accept a serialized
-        // `ProtocolAuthEvidence` from an untrusted source. This test pins
-        // that expectation so any future change is intentional.
-        let evidence = mark_bearer_token_verified("alice");
+    fn failed_evidence_round_trips_via_wire() {
+        // `Failed` IS deserializable; that is the only outcome trusted
+        // wire payloads carry between Reborn services.
+        let evidence = ProtocolAuthEvidence::Failed {
+            failure: ProtocolAuthFailure::SharedSecretMismatch,
+        };
         let json = serde_json::to_string(&evidence).expect("serialize");
         let parsed: ProtocolAuthEvidence = serde_json::from_str(&json).expect("deserialize");
-        assert!(parsed.is_verified());
+        assert_eq!(parsed, evidence);
+    }
+
+    #[test]
+    fn verified_payload_on_the_wire_is_rejected_by_deserialize() {
+        // Hand-craft what a forged `Verified` envelope might look like.
+        // The custom `Deserialize` impl rejects it.
+        let forged = serde_json::json!({
+            "kind": "verified",
+            "claim": {
+                "requirement": {"bearer_token": null},
+                "subject": "attacker"
+            }
+        })
+        .to_string();
+        let result: Result<ProtocolAuthEvidence, _> = serde_json::from_str(&forged);
+        assert!(
+            result.is_err(),
+            "a forged Verified evidence must NOT round-trip through serde"
+        );
+        let err = result.expect_err("must error");
+        let rendered = err.to_string();
+        // Either the kind rejection ("verified... not accepted") or the
+        // unknown-field rejection (`claim`/`seal`) is acceptable; both
+        // close the forgery path. Pin that one of them fires.
+        assert!(
+            (rendered.contains("verified") && rendered.contains("not accepted"))
+                || rendered.contains("unknown field")
+                || rendered.contains("missing field"),
+            "rejection reason should explain why; got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn verified_evidence_in_memory_serializes_but_not_back() {
+        // A `Verified` evidence built by the host can serialize (so logs
+        // and audit trails work) but the produced JSON must NOT round-trip
+        // back into a `Verified` value — round-tripping a `Verified`
+        // outcome would re-open the forgery loophole.
+        let evidence = mark_bearer_token_verified("alice");
+        let json = serde_json::to_string(&evidence).expect("serialize");
+        // Sanity: serialized form claims to be Verified.
+        assert!(json.contains("\"verified\""));
+        // But re-deserializing must fail.
+        let parsed: Result<ProtocolAuthEvidence, _> = serde_json::from_str(&json);
+        assert!(
+            parsed.is_err(),
+            "serialized Verified evidence must not round-trip; got: {parsed:?}"
+        );
+    }
+
+    #[test]
+    fn verified_evidence_unknown_field_is_rejected() {
+        // Even if the wire claims `kind: failed`, an unexpected field
+        // (claim, seal, anything) is rejected to prevent typo-driven
+        // tunneling of structured payloads through a permissive parser.
+        let trojan = serde_json::json!({
+            "kind": "failed",
+            "failure": {"shared_secret_mismatch": null},
+            "claim": {"requirement": {"bearer_token": null}, "subject": "x"}
+        })
+        .to_string();
+        let result: Result<ProtocolAuthEvidence, _> = serde_json::from_str(&trojan);
+        assert!(result.is_err(), "unknown_field must reject");
     }
 }

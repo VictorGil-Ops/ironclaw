@@ -17,10 +17,48 @@
 //! Verifiers in this module compute digests with constant-time comparison
 //! (`subtle::ConstantTimeEq`) to avoid timing oracles.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use hmac::{Hmac, Mac};
 use ironclaw_product_adapters::ProtocolAuthFailure;
+use ironclaw_product_adapters::redaction::RedactedString;
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
+
+/// Default replay-attack window for HMAC verifiers (5 minutes). Matches
+/// Slack's documented recommendation. Configurable per-installation via
+/// [`HmacWebhookAuth::max_age`].
+pub const DEFAULT_HMAC_MAX_AGE_SECS: u64 = 300;
+
+/// Clock seam used by [`HmacWebhookAuth`]. Production hosts use
+/// [`SystemClock`]; tests inject a [`FixedClock`] to drive the timestamp
+/// window deterministically.
+pub trait Clock: Send + Sync {
+    /// Current time as seconds since the Unix epoch.
+    fn now_unix_seconds(&self) -> u64;
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now_unix_seconds(&self) -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+}
+
+/// Test-only clock that returns a fixed timestamp.
+#[derive(Debug, Clone, Copy)]
+pub struct FixedClock(pub u64);
+
+impl Clock for FixedClock {
+    fn now_unix_seconds(&self) -> u64 {
+        self.0
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerificationOutcome {
@@ -36,11 +74,55 @@ pub trait WebhookAuthVerifier {
 }
 
 /// Slack-style request-signature HMAC-SHA-256 verifier.
+///
+/// Verification enforces three properties:
+///
+/// 1. The HMAC digest matches the expected signature (constant-time).
+/// 2. The supplied timestamp is parseable as a Unix epoch second.
+/// 3. The timestamp is within `max_age_secs` of the verifier's clock —
+///    rejecting both stale captures (replay attacks) and timestamps far
+///    in the future (clock-drift / forgery attempts).
 pub struct HmacWebhookAuth {
     pub signature_header: String,
     pub timestamp_header: String,
     pub signing_secret: Vec<u8>,
     pub subject: String,
+    /// Maximum acceptable absolute distance between the request timestamp
+    /// and the verifier's current clock, in seconds. Default
+    /// [`DEFAULT_HMAC_MAX_AGE_SECS`] (5 minutes).
+    pub max_age_secs: u64,
+    /// Clock seam — production passes [`SystemClock`], tests pass
+    /// [`FixedClock`]. Boxed so installations can swap implementations
+    /// without making the verifier generic.
+    pub clock: Box<dyn Clock>,
+}
+
+impl HmacWebhookAuth {
+    pub fn new(
+        signature_header: impl Into<String>,
+        timestamp_header: impl Into<String>,
+        signing_secret: Vec<u8>,
+        subject: impl Into<String>,
+    ) -> Self {
+        Self {
+            signature_header: signature_header.into(),
+            timestamp_header: timestamp_header.into(),
+            signing_secret,
+            subject: subject.into(),
+            max_age_secs: DEFAULT_HMAC_MAX_AGE_SECS,
+            clock: Box::new(SystemClock),
+        }
+    }
+
+    pub fn with_max_age(mut self, max_age_secs: u64) -> Self {
+        self.max_age_secs = max_age_secs;
+        self
+    }
+
+    pub fn with_clock(mut self, clock: Box<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
 }
 
 impl WebhookAuthVerifier for HmacWebhookAuth {
@@ -53,7 +135,7 @@ impl WebhookAuthVerifier for HmacWebhookAuth {
                 failure: ProtocolAuthFailure::Missing,
             };
         };
-        let Some(timestamp) = headers
+        let Some(timestamp_str) = headers
             .get(self.timestamp_header.as_str())
             .and_then(|v| v.to_str().ok())
         else {
@@ -61,8 +143,36 @@ impl WebhookAuthVerifier for HmacWebhookAuth {
                 failure: ProtocolAuthFailure::Missing,
             };
         };
-        let signed_payload = format!("v0:{timestamp}:");
-        let mut mac = Hmac::<Sha256>::new_from_slice(&self.signing_secret).expect("hmac key");
+        // Replay-window check before computing HMAC. Reject stale or
+        // far-future timestamps; both are forgery attempts. The window is
+        // symmetric: |now - ts| > max_age_secs => fail.
+        let Ok(timestamp_secs) = timestamp_str.parse::<i64>() else {
+            return VerificationOutcome::Failed {
+                failure: ProtocolAuthFailure::Malformed,
+            };
+        };
+        let now_secs = self.clock.now_unix_seconds() as i64;
+        let max_age = self.max_age_secs as i64;
+        let drift = (now_secs - timestamp_secs).abs();
+        if drift > max_age {
+            return VerificationOutcome::Failed {
+                failure: ProtocolAuthFailure::Other {
+                    detail: RedactedString::new(format!(
+                        "request timestamp drift {drift}s exceeds {max_age}s window"
+                    )),
+                },
+            };
+        }
+
+        let signed_payload = format!("v0:{timestamp_str}:");
+        let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(&self.signing_secret) else {
+            // HMAC-SHA-256 accepts arbitrary key lengths in the algorithm
+            // spec — `new_from_slice` should never reject a non-empty key.
+            // Treat the unexpected error as a malformed configuration.
+            return VerificationOutcome::Failed {
+                failure: ProtocolAuthFailure::Malformed,
+            };
+        };
         mac.update(signed_payload.as_bytes());
         mac.update(body);
         let expected_bytes = mac.finalize().into_bytes();
@@ -182,12 +292,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn hmac_verifier_accepts_canonical_signature() {
-        let secret = b"super-shared-secret".to_vec();
-        let timestamp = "1234567890";
-        let body = b"{\"event\":\"hello\"}";
-        let mut mac = Hmac::<Sha256>::new_from_slice(&secret).expect("hmac key");
+    fn build_signed_request(
+        secret: &[u8],
+        timestamp: &str,
+        body: &[u8],
+    ) -> (String, http::HeaderMap) {
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("hmac key");
         mac.update(format!("v0:{timestamp}:").as_bytes());
         mac.update(body);
         let digest_hex = hex::encode(mac.finalize().into_bytes());
@@ -196,12 +306,27 @@ mod tests {
             ("X-Slack-Signature", &signature),
             ("X-Slack-Request-Timestamp", timestamp),
         ]);
-        let verifier = HmacWebhookAuth {
-            signature_header: "X-Slack-Signature".into(),
-            timestamp_header: "X-Slack-Request-Timestamp".into(),
-            signing_secret: secret,
-            subject: "slack_install_beta".into(),
-        };
+        (signature, headers)
+    }
+
+    fn verifier_at(now_secs: u64, max_age_secs: u64, secret: Vec<u8>) -> HmacWebhookAuth {
+        HmacWebhookAuth::new(
+            "X-Slack-Signature",
+            "X-Slack-Request-Timestamp",
+            secret,
+            "slack_install_beta",
+        )
+        .with_max_age(max_age_secs)
+        .with_clock(Box::new(FixedClock(now_secs)))
+    }
+
+    #[test]
+    fn hmac_verifier_accepts_canonical_signature_within_window() {
+        let secret = b"super-shared-secret".to_vec();
+        let timestamp = "1234567890";
+        let body = b"{\"event\":\"hello\"}";
+        let (_, headers) = build_signed_request(&secret, timestamp, body);
+        let verifier = verifier_at(1_234_567_900, 60, secret);
         match verifier.verify(&headers, body) {
             VerificationOutcome::Verified { subject } => {
                 assert_eq!(subject, "slack_install_beta");
@@ -215,28 +340,101 @@ mod tests {
         let secret = b"super-shared-secret".to_vec();
         let timestamp = "1234567890";
         let body = b"{\"event\":\"hello\"}";
-        let mut mac = Hmac::<Sha256>::new_from_slice(&secret).expect("hmac key");
-        mac.update(format!("v0:{timestamp}:").as_bytes());
-        mac.update(body);
-        let digest_hex = hex::encode(mac.finalize().into_bytes());
-        let signature = format!("v0={digest_hex}");
-        let headers = header_map(&[
-            ("X-Slack-Signature", &signature),
-            ("X-Slack-Request-Timestamp", timestamp),
-        ]);
-        let verifier = HmacWebhookAuth {
-            signature_header: "X-Slack-Signature".into(),
-            timestamp_header: "X-Slack-Request-Timestamp".into(),
-            signing_secret: secret,
-            subject: "slack_install_beta".into(),
-        };
-        // Verifier is asked to authenticate a different body — must fail
-        // signature mismatch.
+        let (_, headers) = build_signed_request(&secret, timestamp, body);
+        let verifier = verifier_at(1_234_567_900, 60, secret);
         match verifier.verify(&headers, b"{\"event\":\"tampered\"}") {
             VerificationOutcome::Failed { failure } => {
                 assert!(matches!(failure, ProtocolAuthFailure::SignatureMismatch));
             }
             other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hmac_verifier_rejects_stale_timestamp_replay() {
+        // Captured request from 10 minutes ago against a 5-minute window
+        // — must reject before computing the HMAC.
+        let secret = b"super-shared-secret".to_vec();
+        let timestamp = "1_700_000_000".replace('_', "");
+        let body = b"{\"event\":\"hello\"}";
+        let (_, headers) = build_signed_request(&secret, &timestamp, body);
+        let now = 1_700_000_000 + 600; // 10 min later
+        let verifier = verifier_at(now, 300, secret); // 5 min window
+        match verifier.verify(&headers, body) {
+            VerificationOutcome::Failed { failure } => match failure {
+                ProtocolAuthFailure::Other { .. } => {}
+                other => panic!("expected Other (drift), got {other:?}"),
+            },
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hmac_verifier_rejects_far_future_timestamp() {
+        // Far-future timestamps are also forgery attempts — symmetric
+        // window check on |now - ts|.
+        let secret = b"super-shared-secret".to_vec();
+        let timestamp = "1_700_000_000".replace('_', "");
+        let body = b"{}";
+        let (_, headers) = build_signed_request(&secret, &timestamp, body);
+        let now = 1_700_000_000 - 600; // 10 min before
+        let verifier = verifier_at(now, 300, secret);
+        match verifier.verify(&headers, body) {
+            VerificationOutcome::Failed { failure } => match failure {
+                ProtocolAuthFailure::Other { .. } => {}
+                other => panic!("expected Other (drift), got {other:?}"),
+            },
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hmac_verifier_rejects_malformed_timestamp() {
+        let secret = b"super-shared-secret".to_vec();
+        let body = b"{}";
+        let headers = header_map(&[
+            ("X-Slack-Signature", "v0=abc"),
+            ("X-Slack-Request-Timestamp", "not-a-number"),
+        ]);
+        let verifier = verifier_at(1_700_000_000, 300, secret);
+        match verifier.verify(&headers, body) {
+            VerificationOutcome::Failed { failure } => {
+                assert!(matches!(failure, ProtocolAuthFailure::Malformed));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hmac_verifier_accepts_timestamp_at_window_boundary() {
+        let secret = b"super-shared-secret".to_vec();
+        let timestamp = "1_700_000_000".replace('_', "");
+        let body = b"{}";
+        let (_, headers) = build_signed_request(&secret, &timestamp, body);
+        // Exactly at the boundary: drift == max_age. Must pass (closed
+        // window, not open).
+        let now = 1_700_000_000 + 300;
+        let verifier = verifier_at(now, 300, secret);
+        match verifier.verify(&headers, body) {
+            VerificationOutcome::Verified { .. } => {}
+            other => panic!("boundary timestamp should pass, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hmac_verifier_rejects_timestamp_just_outside_window() {
+        let secret = b"super-shared-secret".to_vec();
+        let timestamp = "1_700_000_000".replace('_', "");
+        let body = b"{}";
+        let (_, headers) = build_signed_request(&secret, &timestamp, body);
+        // 1 second past the boundary.
+        let now = 1_700_000_000 + 301;
+        let verifier = verifier_at(now, 300, secret);
+        match verifier.verify(&headers, body) {
+            VerificationOutcome::Failed { failure } => {
+                assert!(matches!(failure, ProtocolAuthFailure::Other { .. }));
+            }
+            other => panic!("just-outside should fail, got {other:?}"),
         }
     }
 }

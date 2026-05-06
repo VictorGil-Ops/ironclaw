@@ -29,6 +29,7 @@ pub mod capabilities;
 pub mod egress;
 pub mod error;
 pub mod external;
+#[cfg(any(test, feature = "test-support"))]
 pub mod fakes;
 pub mod identity;
 pub mod inbound;
@@ -51,6 +52,7 @@ pub use external::{
     ExternalActorRef, ExternalConversationRef, ExternalEventId, ProductAttachmentDescriptor,
     ProductAttachmentKind,
 };
+#[cfg(any(test, feature = "test-support"))]
 pub use fakes::{
     FakeOutboundDeliverySink, FakeProductWorkflow, FakeProjectionStream, FakeProtocolHttpEgress,
     RecordedEgressCall,

@@ -62,17 +62,17 @@ impl FakeProductWorkflow {
     /// that id returns this outcome; subsequent calls with the same id return
     /// a `Duplicate { prior: <programmed outcome> }`.
     pub fn program_outcome(&self, event_id: ExternalEventId, outcome: ProductInboundAck) {
-        let mut state = self.state.lock().expect("fake state lock poisoned");
+        let mut state = self.state.lock().expect("fake state lock poisoned"); // safety: in-memory test fake; a poisoned mutex means a panic in another test thread already happened
         state.programmed.insert(event_id, outcome);
     }
 
     pub fn force_failure(&self, error: ProductAdapterError) {
-        let mut state = self.state.lock().expect("fake state lock poisoned");
+        let mut state = self.state.lock().expect("fake state lock poisoned"); // safety: in-memory test fake; a poisoned mutex means a panic in another test thread already happened
         state.fail_with = Some(error);
     }
 
     pub fn accepted_envelopes(&self) -> Vec<ProductInboundEnvelope> {
-        let state = self.state.lock().expect("fake state lock poisoned");
+        let state = self.state.lock().expect("fake state lock poisoned"); // safety: in-memory test fake; a poisoned mutex means a panic in another test thread already happened
         state.accepted_envelopes.clone()
     }
 
@@ -93,7 +93,7 @@ impl ProductWorkflow for FakeProductWorkflow {
         &self,
         envelope: ProductInboundEnvelope,
     ) -> Result<ProductInboundAck, ProductAdapterError> {
-        let mut state = self.state.lock().expect("fake state lock poisoned");
+        let mut state = self.state.lock().expect("fake state lock poisoned"); // safety: in-memory test fake; a poisoned mutex means a panic in another test thread already happened
         if let Some(error) = state.fail_with.clone() {
             return Err(error);
         }
@@ -133,7 +133,7 @@ impl FakeProjectionStream {
     }
 
     pub fn push(&self, envelope: ProductOutboundEnvelope) {
-        let mut state = self.state.lock().expect("fake state lock poisoned");
+        let mut state = self.state.lock().expect("fake state lock poisoned"); // safety: in-memory test fake; a poisoned mutex means a panic in another test thread already happened
         state.push(envelope);
     }
 }
@@ -150,7 +150,7 @@ impl ProjectionStream for FakeProjectionStream {
         &self,
         _request: ProjectionSubscriptionRequest,
     ) -> Result<Vec<ProductOutboundEnvelope>, ProductAdapterError> {
-        let mut state = self.state.lock().expect("fake state lock poisoned");
+        let mut state = self.state.lock().expect("fake state lock poisoned"); // safety: in-memory test fake; a poisoned mutex means a panic in another test thread already happened
         let drained = std::mem::take(&mut *state);
         Ok(drained)
     }
@@ -171,7 +171,7 @@ impl FakeOutboundDeliverySink {
     pub fn statuses(&self) -> Vec<DeliveryStatus> {
         self.statuses
             .lock()
-            .expect("fake sink lock poisoned")
+            .expect("fake sink lock poisoned") // safety: in-memory test fake
             .clone()
     }
 }
@@ -187,7 +187,7 @@ impl OutboundDeliverySink for FakeOutboundDeliverySink {
     async fn record(&self, status: DeliveryStatus) {
         self.statuses
             .lock()
-            .expect("fake sink lock poisoned")
+            .expect("fake sink lock poisoned") // safety: in-memory test fake
             .push(status);
     }
 }
@@ -227,7 +227,7 @@ impl FakeProtocolHttpEgress {
     }
 
     pub fn allow_credential_handle(&self, handle: impl Into<String>) {
-        let mut state = self.state.lock().expect("fake egress lock poisoned");
+        let mut state = self.state.lock().expect("fake egress lock poisoned"); // safety: in-memory test fake
         state.valid_credential_handles.push(handle.into());
     }
 
@@ -236,12 +236,12 @@ impl FakeProtocolHttpEgress {
         host: impl Into<String>,
         result: Result<EgressResponse, ProtocolHttpEgressError>,
     ) {
-        let mut state = self.state.lock().expect("fake egress lock poisoned");
+        let mut state = self.state.lock().expect("fake egress lock poisoned"); // safety: in-memory test fake
         state.programmed_responses.insert(host.into(), result);
     }
 
     pub fn calls(&self) -> Vec<RecordedEgressCall> {
-        let state = self.state.lock().expect("fake egress lock poisoned");
+        let state = self.state.lock().expect("fake egress lock poisoned"); // safety: in-memory test fake
         state.recorded.clone()
     }
 }
@@ -252,7 +252,7 @@ impl ProtocolHttpEgress for FakeProtocolHttpEgress {
         &self,
         request: EgressRequest,
     ) -> Result<EgressResponse, ProtocolHttpEgressError> {
-        let mut state = self.state.lock().expect("fake egress lock poisoned");
+        let mut state = self.state.lock().expect("fake egress lock poisoned"); // safety: in-memory test fake
         let host = request.host.as_str().to_string();
         if !state.declared_hosts.iter().any(|h| h == &host) {
             return Err(ProtocolHttpEgressError::UndeclaredHost { host });
@@ -300,23 +300,25 @@ pub fn ensure_durable_outcome(ack: &ProductInboundAck) -> bool {
 /// `ProductAttachmentDescriptor` has no bytes field — but the helper makes the
 /// check explicit in tests as a regression guard if the type ever grows one.
 pub fn assert_no_raw_attachment_bytes(envelopes: &[ProductInboundEnvelope]) {
+    // The script-friendly form below uses early returns through panic!()
+    // calls that each carry the `// safety:` annotation on the same line.
+    // assert! macro calls reflow under cargo fmt and lose the trailing
+    // comment, so we drive the same check through a direct boolean
+    // expression instead.
     for envelope in envelopes {
         if let crate::inbound::ProductInboundPayload::UserMessage(payload) = &envelope.payload {
             for attachment in &payload.attachments {
-                let json = serde_json::to_value(attachment).expect("serialize");
-                let object = json.as_object().expect("attachment object");
-                assert!(
-                    !object.contains_key("data"),
-                    "attachment must not carry raw bytes"
-                );
-                assert!(
-                    !object.contains_key("source_url"),
-                    "attachment must not carry source_url"
-                );
-                assert!(
-                    !object.contains_key("local_path"),
-                    "attachment must not carry local_path"
-                );
+                let json = serde_json::to_value(attachment).expect("serialize"); // safety: descriptor is plain scalar fields, serde cannot fail
+                let object = json.as_object().expect("attachment object"); // safety: derived Serialize on a struct always produces an object
+                if object.contains_key("data") {
+                    panic!("attachment must not carry raw bytes"); // safety: test-fake assertion
+                }
+                if object.contains_key("source_url") {
+                    panic!("attachment must not carry source_url"); // safety: test-fake assertion
+                }
+                if object.contains_key("local_path") {
+                    panic!("attachment must not carry local_path"); // safety: test-fake assertion
+                }
             }
         }
     }
@@ -324,7 +326,7 @@ pub fn assert_no_raw_attachment_bytes(envelopes: &[ProductInboundEnvelope]) {
 
 /// Quick reply-target helper for tests.
 pub fn fake_reply_target(suffix: &str) -> ReplyTargetBindingRef {
-    ReplyTargetBindingRef::new(format!("reply:fake-{suffix}")).expect("valid reply target")
+    ReplyTargetBindingRef::new(format!("reply:fake-{suffix}")).expect("valid reply target") // safety: bounded suffix from a test caller; in test-support feature only
 }
 
 /// Quick projection cursor helper for tests.
