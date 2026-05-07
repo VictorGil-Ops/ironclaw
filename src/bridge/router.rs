@@ -3258,6 +3258,100 @@ pub async fn handle_expected(
     }
 }
 
+/// Handle `approve <channel> <code>` — claim a pairing code from any chat
+/// surface (TUI, CLI, web, or Telegram itself). Mirrors what the web
+/// `POST /api/pairing/{channel}/approve` handler does, so the same approval
+/// works regardless of where the user typed it. This closes #3317, where
+/// the Telegram bot's pairing reply pointed users at "IronClaw" without
+/// naming a surface and the agent rejected the resulting chat input.
+pub async fn handle_pairing_claim(
+    agent: &Agent,
+    message: &IncomingMessage,
+    channel: &str,
+    code: &str,
+) -> Result<BridgeOutcome, Error> {
+    use ironclaw_common::ExtensionName;
+
+    // Validate the channel name at the boundary, mirroring
+    // `web::features::pairing::parse_channel`. We discard the canonical
+    // form and carry the lowercased raw string forward because the pairing
+    // store keys off the un-folded name (see `pairing/mod.rs`
+    // `normalize_channel_name`).
+    let lowered = channel.to_ascii_lowercase();
+    if let Err(e) = ExtensionName::new(&lowered) {
+        return Ok(BridgeOutcome::Respond(format!(
+            "Invalid channel name `{channel}`: {e}"
+        )));
+    }
+
+    let Some(ext_mgr) = agent.deps.extension_manager.as_ref() else {
+        return Ok(BridgeOutcome::Respond(
+            "Pairing is not available — extension manager is not configured.".into(),
+        ));
+    };
+    let Some(pairing_store) = ext_mgr.pairing_store() else {
+        return Ok(BridgeOutcome::Respond(
+            "Pairing is not available — pairing store is not configured.".into(),
+        ));
+    };
+
+    // Bind the pairing to the message's user_id. `from_trusted` matches the
+    // web handler's pattern: the user identity is sourced from the inbound
+    // channel auth, not user-controlled chat content. Role is irrelevant
+    // for self-service approval — only the id is recorded on the pairing
+    // row.
+    let owner_id = crate::ownership::UserId::from_trusted(
+        message.user_id.clone(),
+        crate::ownership::UserRole::Regular,
+    );
+
+    let approval = match pairing_store.approve(&lowered, code, &owner_id).await {
+        Ok(approval) => approval,
+        Err(crate::error::DatabaseError::NotFound { .. }) => {
+            return Ok(BridgeOutcome::Respond(
+                "Invalid or expired pairing code.".into(),
+            ));
+        }
+        Err(e) => {
+            debug!(channel = %lowered, error = %e, "pairing approval failed");
+            return Ok(BridgeOutcome::Respond(
+                "Internal error processing pairing approval.".into(),
+            ));
+        }
+    };
+
+    // Propagate to the running channel so the WASM channel picks up the new
+    // owner binding without a restart. Same shape as the web handler — on
+    // propagation failure, revert the DB approval so the user can retry.
+    match ext_mgr
+        .complete_pairing_approval(&lowered, &approval.external_id)
+        .await
+    {
+        Ok(()) => Ok(BridgeOutcome::Respond(format!(
+            "Pairing approved — `{lowered}` is now linked to your account."
+        ))),
+        Err(e) => {
+            tracing::warn!(
+                channel = %lowered,
+                error = %e,
+                "pairing approval propagation to running channel failed"
+            );
+            if let Err(revert_err) = pairing_store.revert_approval(&approval).await {
+                tracing::warn!(
+                    channel = %lowered,
+                    error = %revert_err,
+                    "failed to revert pairing approval after propagation failure"
+                );
+            }
+            Ok(BridgeOutcome::Respond(
+                "Pairing was approved, but the running channel could not be updated. \
+                 Please retry or restart the channel."
+                    .into(),
+            ))
+        }
+    }
+}
+
 /// Find the most recent thread in a conversation (checks active threads first,
 /// then falls back to the last completed thread visible in conversation entries).
 async fn find_most_recent_thread(
@@ -3321,6 +3415,29 @@ async fn clear_engine_conversation(agent: &Agent, message: &IncomingMessage) -> 
             // Discard all pending gates for this thread regardless of user,
             // preventing orphaned gates that can never be resolved (#2323).
             state.pending_gates.discard_for_thread(*tid).await;
+        }
+    }
+
+    // Drain in-flight OAuth flows for this user (#3320).
+    //
+    // Pending flows otherwise live until `OAUTH_FLOW_EXPIRY` (5 min). On a
+    // user-initiated `/clear`, the user expects a clean slate — leaving a
+    // ghost flow can: (a) match a stale `state` from a never-completed
+    // browser tab, (b) fool a fresh auth attempt's CSRF dedupe, or
+    // (c) cause the next `extension_manager::pending_oauth_flows()` lookup
+    // to find an entry whose corresponding engine gate has already been
+    // discarded above. Drain all flows owned by the clearing user.
+    if let Some(ext_mgr) = agent.deps.extension_manager.as_ref() {
+        let mut flows = ext_mgr.pending_oauth_flows().write().await;
+        let before = flows.len();
+        flows.retain(|_state, flow| flow.user_id != message.user_id);
+        let removed = before.saturating_sub(flows.len());
+        if removed > 0 {
+            debug!(
+                user_id = %message.user_id,
+                removed,
+                "engine v2: drained pending OAuth flows on /clear"
+            );
         }
     }
 
@@ -11387,5 +11504,55 @@ mod tests {
         );
         let info = thread_to_info(&thread);
         assert_eq!(info.title.as_deref(), Some("Short first line"));
+    }
+
+    /// Regression test for #3317: when a user types a pairing claim into a
+    /// chat surface but the gateway has no `ExtensionManager` wired up, the
+    /// handler must produce a clear, user-facing message instead of
+    /// panicking or returning an internal error. The corresponding
+    /// happy-path test (with a real `ExtensionManager`) lives in the
+    /// telegram pairing chat-claim integration test (gated on libsql).
+    #[tokio::test]
+    async fn handle_pairing_claim_without_ext_mgr_responds_with_unavailable_message() {
+        let (agent, _statuses) = make_router_test_agent(None).await;
+        let message = IncomingMessage::new("tui", "alice", "approve telegram ABC12345");
+
+        let outcome = handle_pairing_claim(&agent, &message, "telegram", "ABC12345")
+            .await
+            .expect("handle_pairing_claim should not error");
+
+        match outcome {
+            BridgeOutcome::Respond(text) => {
+                assert!(
+                    text.contains("Pairing is not available"),
+                    "expected unavailable-message, got: {text}"
+                );
+            }
+            other => panic!("expected Respond, got {other:?}"),
+        }
+    }
+
+    /// Regression test for #3317: malformed channel slugs (path traversal,
+    /// empty, oversize) must reject at the boundary rather than reaching
+    /// the pairing store. Mirrors `web::features::pairing::parse_channel`'s
+    /// `ExtensionName::new` validation.
+    #[tokio::test]
+    async fn handle_pairing_claim_rejects_invalid_channel_name() {
+        let (agent, _statuses) = make_router_test_agent(None).await;
+        let message = IncomingMessage::new("tui", "alice", "approve ../etc/passwd ABC");
+
+        let outcome = handle_pairing_claim(&agent, &message, "../etc/passwd", "ABC")
+            .await
+            .expect("handle_pairing_claim should not error");
+
+        match outcome {
+            BridgeOutcome::Respond(text) => {
+                assert!(
+                    text.contains("Invalid channel name"),
+                    "expected invalid-channel message, got: {text}"
+                );
+            }
+            other => panic!("expected Respond, got {other:?}"),
+        }
     }
 }

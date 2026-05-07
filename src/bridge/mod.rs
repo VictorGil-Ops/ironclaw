@@ -58,6 +58,7 @@ pub use router::{
     handle_external_callback,
     handle_interrupt,
     handle_new_thread,
+    handle_pairing_claim,
     handle_with_engine,
     has_any_pending_gate,
     has_pending_auth,
