@@ -26,6 +26,13 @@ AUTH_FULL_TESTS = AUTH_SMOKE_TESTS + [
 
 AUTH_CHANNEL_TESTS = [
     "tests/e2e/scenarios/test_v2_auth_oauth_matrix.py::test_wasm_channel_oauth_roundtrip",
+    # ironclaw#3317 — pairing reply must name every IronClaw surface, and
+    # `approve telegram CODE` typed in chat must complete the pairing.
+    # Without this lane the whole class of "user pastes code in the wrong
+    # place, agent improvises an unhelpful answer" regressions would only
+    # surface in production.
+    "tests/e2e/scenarios/test_telegram_pairing_chat_claim.py::test_telegram_pairing_reply_names_every_surface",
+    "tests/e2e/scenarios/test_telegram_pairing_chat_claim.py::test_chat_surface_approves_pairing_code",
 ]
 
 AUTH_PROFILES: dict[str, list[str]] = {
