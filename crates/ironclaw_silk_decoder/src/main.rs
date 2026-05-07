@@ -11,7 +11,7 @@
 use std::io::{self, Read, Write};
 use std::process::ExitCode;
 
-use silk_rs::decode_silk;
+use silk_codec::decode_silk;
 
 const DEFAULT_SAMPLE_RATE_HZ: i32 = 24_000;
 const MIN_SAMPLE_RATE_HZ: i32 = 8_000;

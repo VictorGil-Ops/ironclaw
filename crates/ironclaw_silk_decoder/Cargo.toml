@@ -1,5 +1,5 @@
 # Standalone — explicitly NOT part of the IronClaw workspace so the main
-# `cargo build` does not pull in `silk-rs` (which requires `bindgen` +
+# `cargo build` does not pull in `silk-codec` (which requires `bindgen` +
 # `libclang` and a C toolchain). See `crates/ironclaw_silk_decoder/README.md`.
 [workspace]
 
@@ -16,4 +16,4 @@ name = "ironclaw-silk-decoder"
 path = "src/main.rs"
 
 [dependencies]
-silk-rs = "0.2.0"
+silk-codec = "0.2.0"

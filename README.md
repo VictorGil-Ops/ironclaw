@@ -147,7 +147,7 @@ For **full release** (after modifying channel sources), run `./scripts/build-all
 
 > **Optional:** WeChat voice notes (`audio/silk`) require the standalone
 > `ironclaw-silk-decoder` helper to be transcribable. It's excluded from the
-> default workspace build because `silk-rs` pulls in `bindgen`/`libclang`.
+> default workspace build because `silk-codec` pulls in `bindgen`/`libclang`.
 > Build it separately with `./crates/ironclaw_silk_decoder/build.sh` (needs
 > libclang + a C toolchain) and put the resulting binary on `$PATH`, beside
 > the `ironclaw` binary, or pointed at by `IRONCLAW_SILK_DECODER`. Without

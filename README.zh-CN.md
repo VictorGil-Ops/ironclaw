@@ -143,7 +143,7 @@ cargo test
 如需进行**完整发布构建**（修改了渠道源码后），先运行 `./scripts/build-all.sh` 重新编译渠道。
 
 > **可选：** 微信语音消息（`audio/silk`）需要独立的 `ironclaw-silk-decoder`
-> 辅助二进制才能被转写。该工具因为依赖 `silk-rs`（会引入 `bindgen` /
+> 辅助二进制才能被转写。该工具因为依赖 `silk-codec`（会引入 `bindgen` /
 > `libclang`），已被排除在默认工作区之外。请使用
 > `./crates/ironclaw_silk_decoder/build.sh` 单独编译（需要 libclang 与 C
 > 编译器），再把生成的二进制放到 `$PATH`、`ironclaw` 同级目录，或通过

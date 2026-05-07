@@ -5,9 +5,9 @@ WAV-wrapped 16‑bit mono PCM stream that downstream consumers (the
 transcription pipeline, the agent, audio players) can use.
 
 The decoder lives in its own crate for one reason: SILK decoding requires
-[`silk-rs`](https://crates.io/crates/silk-rs), which compiles a vendored C
-implementation and pulls in `bindgen` + `clang-sys`. Anything that uses
-`silk-rs` therefore needs `libclang` and a C toolchain at build time. By
+[`silk-codec`](https://crates.io/crates/silk-codec), which compiles a vendored
+C implementation and pulls in `bindgen` + `clang-sys`. Anything that uses
+`silk-codec` therefore needs `libclang` and a C toolchain at build time. By
 keeping that dependency in a separate, workspace-excluded crate, the main
 IronClaw build does **not** need `libclang`.
 
