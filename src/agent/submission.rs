@@ -168,10 +168,11 @@ impl SubmissionParser {
             let mut parts = rest.split_whitespace();
             if let (Some(channel), Some(code), None) = (parts.next(), parts.next(), parts.next()) {
                 let channel = channel.to_string();
-                // Pairing codes are case-insensitive at the store layer
+                // The parser already lowercased the input (`lower`), so both
+                // `channel` and `code` flow through in lowercase. The store
+                // layer is case-insensitive
                 // (`db.libsql.pairing` test_approve_pairing_case_insensitive),
-                // but the wire shape is uppercase alphanumeric. Carry whatever
-                // the user typed through; the store normalizes.
+                // so the on-the-wire upper-case shape still matches.
                 let code = code.to_string();
                 if !channel.is_empty() && !code.is_empty() {
                     return Submission::PairingClaim { channel, code };
@@ -438,7 +439,9 @@ pub enum Submission {
     PairingClaim {
         /// Channel name (e.g. `telegram`, `slack-relay`).
         channel: String,
-        /// Pairing code as the user typed it; the store normalizes.
+        /// Pairing code, lowercased by `SubmissionParser::parse`. The
+        /// pairing store is case-insensitive, so the wire-format
+        /// uppercase shape still matches.
         code: String,
     },
 }

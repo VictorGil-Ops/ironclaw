@@ -90,9 +90,15 @@ impl OauthCallbackFailure {
 }
 
 /// Generate a short correlation ID from the redacted state fingerprint plus
-/// the current monotonic-ish timestamp. Returned in `tracing::warn!` calls
-/// and in the user-facing error subtitle so a "I saw 400" report can be
-/// pinned to one log line.
+/// the current monotonic-ish timestamp. Emitted on every `tracing::warn!`
+/// call in the OAuth callback failure paths so an operator can map a
+/// timestamp / category / state fingerprint cluster to a single log line.
+///
+/// Currently logs-only: the user-facing landing page rendered by
+/// [`oauth_error_page`] uses [`crate::auth::oauth::landing_html`], which has
+/// a fixed failure subtitle and does not embed the correlation. Plumbing
+/// the ID into the HTML is a follow-up — see `landing_html` for the
+/// fixed-subtitle wiring.
 ///
 /// 8 hex characters — collision-resistant within a single tracing window
 /// (operators grep recent logs), short enough to read aloud over phone.
