@@ -12234,22 +12234,22 @@ mod tests {
         let channels_dir = dir.path().join("channels");
         std::fs::create_dir_all(&channels_dir).expect("channels dir");
 
-        std::fs::write(channels_dir.join("wecom.wasm"), b"\0asm fake").expect("write wasm");
+        std::fs::write(channels_dir.join("sample.wasm"), b"\0asm fake").expect("write wasm");
         let caps = serde_json::json!({
             "type": "channel",
-            "name": "wecom",
+            "name": "sample",
             "setup": {
                 "required_secrets": [
                     {
-                        "name": "wecom_corp_id",
-                        "prompt": "Enter your WeCom Corp ID",
-                        "validation": "^ww[a-zA-Z0-9]{16}$"
+                        "name": "sample_bot_token",
+                        "prompt": "Enter a sample bot token",
+                        "validation": "^tok_[A-Za-z0-9]{8}$"
                     }
                 ]
             }
         });
         std::fs::write(
-            channels_dir.join("wecom.capabilities.json"),
+            channels_dir.join("sample.capabilities.json"),
             serde_json::to_string(&caps).expect("serialize caps"),
         )
         .expect("write capabilities");
@@ -12257,16 +12257,16 @@ mod tests {
         let mgr = make_manager_custom_dirs(dir.path().join("tools"), channels_dir);
         let err = mgr
             .configure(
-                "wecom",
+                "sample",
                 &std::collections::HashMap::from([(
-                    "wecom_corp_id".to_string(),
-                    "not-a-corp-id".to_string(),
+                    "sample_bot_token".to_string(),
+                    "not-a-token".to_string(),
                 )]),
                 &std::collections::HashMap::new(),
                 "test",
             )
             .await
-            .expect_err("invalid corp id should fail validation");
+            .expect_err("invalid token should fail validation");
 
         assert!(
             matches!(err, ExtensionError::ValidationFailed(_)),
@@ -12274,7 +12274,7 @@ mod tests {
         );
         assert!(
             !mgr.secrets
-                .exists("test", "wecom_corp_id")
+                .exists("test", "sample_bot_token")
                 .await
                 .unwrap_or(true),
             "invalid secret must not be persisted"
@@ -12287,22 +12287,22 @@ mod tests {
         let channels_dir = dir.path().join("channels");
         std::fs::create_dir_all(&channels_dir).expect("channels dir");
 
-        std::fs::write(channels_dir.join("wecom.wasm"), b"\0asm fake").expect("write wasm");
+        std::fs::write(channels_dir.join("sample.wasm"), b"\0asm fake").expect("write wasm");
         let caps = serde_json::json!({
             "type": "channel",
-            "name": "wecom",
+            "name": "sample",
             "setup": {
                 "required_secrets": [
                     {
-                        "name": "wecom_callback_encoding_aes_key",
-                        "prompt": "Enter your WeCom callback EncodingAESKey",
+                        "name": "sample_signing_key",
+                        "prompt": "Enter a sample signing key",
                         "validation": "^[A-Za-z0-9]{43}$"
                     }
                 ]
             }
         });
         std::fs::write(
-            channels_dir.join("wecom.capabilities.json"),
+            channels_dir.join("sample.capabilities.json"),
             serde_json::to_string(&caps).expect("serialize caps"),
         )
         .expect("write capabilities");
@@ -12312,7 +12312,7 @@ mod tests {
             .create(
                 "test",
                 crate::secrets::CreateSecretParams::new(
-                    "wecom_callback_encoding_aes_key",
+                    "sample_signing_key",
                     "bad key with spaces",
                 ),
             )
@@ -12320,20 +12320,19 @@ mod tests {
             .expect("store invalid secret");
 
         assert_eq!(
-            mgr.check_channel_auth_status("wecom", "test").await,
+            mgr.check_channel_auth_status("sample", "test").await,
             ToolAuthState::NeedsSetup
         );
     }
 
     #[test]
     fn validation_endpoint_body_error_extracts_errcode_message() {
-        let error = super::validation_endpoint_body_error(
-            br#"{"errcode":40013,"errmsg":"invalid corpid"}"#,
-        )
-        .expect("wecom errcode should be treated as failure");
+        let error =
+            super::validation_endpoint_body_error(br#"{"errcode":40013,"errmsg":"invalid token"}"#)
+                .expect("non-zero errcode should be treated as failure");
         assert_eq!(
             error,
-            "Validation endpoint returned errcode 40013: invalid corpid"
+            "Validation endpoint returned errcode 40013: invalid token"
         );
         assert!(super::validation_endpoint_body_error(br#"{"errcode":0,"errmsg":"ok"}"#).is_none());
     }
@@ -12348,15 +12347,19 @@ mod tests {
     #[test]
     fn validate_setup_secret_value_accepts_bounded_validation_pattern() {
         assert!(
-            super::validate_setup_secret_value("wecom_corp_id", "ww123abc", Some(r"^ww[a-z0-9]+$"))
-                .is_ok()
+            super::validate_setup_secret_value(
+                "sample_secret",
+                "tok_123abc",
+                Some(r"^tok_[a-z0-9]+$")
+            )
+            .is_ok()
         );
     }
 
     #[test]
     fn validate_setup_secret_value_rejects_oversized_validation_pattern() {
         let pattern = "a".repeat(super::SETUP_SECRET_VALIDATION_PATTERN_MAX_BYTES + 1);
-        let err = super::validate_setup_secret_value("wecom_corp_id", "ww123abc", Some(&pattern))
+        let err = super::validate_setup_secret_value("sample_secret", "tok_123abc", Some(&pattern))
             .expect_err("oversized validation pattern should fail closed");
 
         assert!(
@@ -12368,12 +12371,15 @@ mod tests {
     #[test]
     fn validation_endpoint_placeholder_names_extracts_unique_names_without_regex() {
         let names = super::validation_endpoint_placeholder_names(
-            "https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid={wecom_corp_id}&corpsecret={wecom_corp_secret}&again={wecom_corp_id}",
+            "https://api.example.com/validate?first={sample_secret}&second={sample_refresh_secret}&again={sample_secret}",
         );
 
         assert_eq!(
             names.into_iter().collect::<Vec<_>>(),
-            vec!["wecom_corp_id".to_string(), "wecom_corp_secret".to_string()]
+            vec![
+                "sample_refresh_secret".to_string(),
+                "sample_secret".to_string()
+            ]
         );
     }
 
@@ -12381,9 +12387,9 @@ mod tests {
     fn validation_endpoint_disallowed_placeholder_rejects_undeclared_secret_names() {
         let placeholders = std::collections::BTreeSet::from([
             "openai_api_key".to_string(),
-            "wecom_corp_id".to_string(),
+            "sample_secret".to_string(),
         ]);
-        let allowed = std::collections::HashSet::from(["wecom_corp_id".to_string()]);
+        let allowed = std::collections::HashSet::from(["sample_secret".to_string()]);
 
         assert_eq!(
             super::validation_endpoint_disallowed_placeholder(&placeholders, &allowed),
@@ -12392,7 +12398,7 @@ mod tests {
 
         let allowed = std::collections::HashSet::from([
             "openai_api_key".to_string(),
-            "wecom_corp_id".to_string(),
+            "sample_secret".to_string(),
         ]);
         assert_eq!(
             super::validation_endpoint_disallowed_placeholder(&placeholders, &allowed),

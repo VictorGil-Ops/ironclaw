@@ -516,11 +516,6 @@ I18n.register('en', {
   // Setup fields
   'setup.secret.wecom_bot_id': 'Bot ID',
   'setup.secret.wecom_bot_secret': 'Bot Secret',
-  'setup.secret.wecom_corp_id': 'Corp ID',
-  'setup.secret.wecom_corp_secret': 'App Secret',
-  'setup.secret.wecom_agent_id': 'Agent ID',
-  'setup.secret.wecom_callback_token': 'Callback Token',
-  'setup.secret.wecom_callback_encoding_aes_key': 'Callback EncodingAESKey',
 
   // Settings toolbar
   'settings.export': 'Export',

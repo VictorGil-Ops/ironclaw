@@ -76,7 +76,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 | iMessage | ✅ | ❌ | P3 | BlueBubbles or Linq recommended |
 | Linq | ✅ | ❌ | P3 | Real iMessage via API, no Mac required |
 | Feishu/Lark | ✅ | 🚧 | P3 | WASM channel with Event Subscription v2.0; Bitable/Docx tools planned |
-| WeCom | ✅ | 🚧 | P2 | Standalone WASM channel with callback + Agent API MVP complete; bot websocket runtime supports bot-first text plus direct AI Bot media upload/send for generated images without app credentials |
+| WeCom | ✅ | 🚧 | P2 | Standalone WASM channel focused on WeCom intelligent bot WebSocket inbound/outbound, pairing, group sessions, inbound media hydration, and direct Bot media upload/send; self-built app callback + Agent API deferred |
 | LINE | ✅ | ❌ | P3 | |
 | WebChat | ✅ | ✅ | - | Web gateway chat |
 | Matrix | ✅ | ❌ | P3 | E2EE support |

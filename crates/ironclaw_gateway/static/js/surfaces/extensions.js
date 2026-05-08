@@ -647,12 +647,7 @@ function basicConfigureValidationError(field, value) {
 
   const validators = {
     wecom_bot_id: /^[A-Za-z0-9_-]{3,128}$/,
-    wecom_bot_secret: /^[A-Za-z0-9_-]{16,128}$/,
-    wecom_corp_id: /^ww[a-zA-Z0-9]{16}$/,
-    wecom_corp_secret: /^[A-Za-z0-9_-]{16,128}$/,
-    wecom_agent_id: /^[1-9][0-9]{0,15}$/,
-    wecom_callback_token: /^[A-Za-z0-9._~-]{3,128}$/,
-    wecom_callback_encoding_aes_key: /^[A-Za-z0-9]{43}$/
+    wecom_bot_secret: /^[A-Za-z0-9_-]{16,128}$/
   };
   const validator = validators[field.name];
   if (validator && !validator.test(value)) {

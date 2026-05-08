@@ -515,11 +515,6 @@ I18n.register('ko', {
   // 설정 필드
   'setup.secret.wecom_bot_id': 'Bot ID',
   'setup.secret.wecom_bot_secret': 'Bot Secret',
-  'setup.secret.wecom_corp_id': 'Corp ID',
-  'setup.secret.wecom_corp_secret': 'App Secret',
-  'setup.secret.wecom_agent_id': 'Agent ID',
-  'setup.secret.wecom_callback_token': 'Callback Token',
-  'setup.secret.wecom_callback_encoding_aes_key': 'Callback EncodingAESKey',
 
   // 설정 도구 모음
   'settings.export': '내보내기',

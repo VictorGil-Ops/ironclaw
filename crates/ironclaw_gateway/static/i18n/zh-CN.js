@@ -515,11 +515,6 @@ I18n.register('zh-CN', {
   // 设置字段
   'setup.secret.wecom_bot_id': '机器人 ID',
   'setup.secret.wecom_bot_secret': '机器人 Secret',
-  'setup.secret.wecom_corp_id': '企业 ID',
-  'setup.secret.wecom_corp_secret': '自建应用 Secret',
-  'setup.secret.wecom_agent_id': 'Agent ID',
-  'setup.secret.wecom_callback_token': '回调 Token',
-  'setup.secret.wecom_callback_encoding_aes_key': '回调 EncodingAESKey',
 
   // 设置工具栏
   'settings.export': '导出',
