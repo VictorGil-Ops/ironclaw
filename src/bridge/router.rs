@@ -3568,9 +3568,28 @@ pub async fn handle_pairing_claim(
     // store keys off the un-folded name (see `pairing/mod.rs`
     // `normalize_channel_name`).
     let lowered = channel.to_ascii_lowercase();
-    if let Err(e) = ExtensionName::new(&lowered) {
+    if ExtensionName::new(&lowered).is_err() {
+        // The raw `channel` token comes from chat input and is unbounded.
+        // Cap the echo at 32 characters and strip non-printable / non-
+        // alphanumeric characters before rendering, so a hostile or
+        // accidentally-pasted blob can't blow up the chat reply or smuggle
+        // control characters / Markdown through to the SSE / Telegram /
+        // TUI surface. The underlying `IdentityError` variants also carry
+        // the raw input verbatim, so we render a fixed category message
+        // rather than `{e}` to keep the reply size bounded by the echo.
+        let preview: String = channel
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+            .take(32)
+            .collect();
+        let preview = if preview.is_empty() {
+            "<empty>".to_string()
+        } else {
+            preview
+        };
         return Ok(BridgeOutcome::Respond(format!(
-            "Invalid channel name `{channel}`: {e}"
+            "Invalid channel name `{preview}` — channel names must be \
+             lowercase letters, digits, or underscores."
         )));
     }
 
@@ -12256,6 +12275,57 @@ mod tests {
             }
             other => panic!("expected Respond, got {other:?}"),
         }
+    }
+
+    /// The invalid-channel reply echoes a slice of what the user typed so
+    /// they know which token was rejected, but the echo must be bounded
+    /// and printable: an attacker-controlled chat input shouldn't be able
+    /// to inject backticks, control characters, or kilobytes of payload
+    /// into the SSE / Telegram / TUI reply through this path.
+    #[tokio::test]
+    async fn handle_pairing_claim_invalid_channel_echo_is_bounded_and_sanitized() {
+        let (agent, _statuses) = make_router_test_agent(None).await;
+        let message = IncomingMessage::new("tui", "alice", "approve x ABC");
+
+        // 200-character payload mixing control chars, backticks, and
+        // markdown — well beyond any real channel slug.
+        let hostile = format!(
+            "{}`malicious`\x07\x1b[31m{}",
+            "A".repeat(80),
+            "B".repeat(120)
+        );
+        let outcome = handle_pairing_claim(&agent, &message, &hostile, "ABC")
+            .await
+            .expect("handle_pairing_claim should not error");
+
+        let text = match outcome {
+            BridgeOutcome::Respond(text) => text,
+            other => panic!("expected Respond, got {other:?}"),
+        };
+
+        assert!(
+            text.contains("Invalid channel name"),
+            "expected invalid-channel message, got: {text}"
+        );
+        assert!(
+            !text.contains('`') || text.matches('`').count() == 2,
+            "echo must not introduce extra backticks beyond the two delimiters: {text}"
+        );
+        assert!(
+            !text.contains('\x07') && !text.contains('\x1b'),
+            "echo must strip control characters: {text:?}"
+        );
+        assert!(
+            !text.contains("malicious"),
+            "non-alphanumeric markup must be stripped from the echo: {text}"
+        );
+        // Cap the rendered length to "Invalid channel name `<≤32 chars>`: <err>"
+        // — generous upper bound here just confirms the echo isn't unbounded.
+        assert!(
+            text.len() < 200,
+            "rendered reply must be bounded, got {} chars: {text}",
+            text.len()
+        );
     }
 
     /// Regression: when an Approval gate is parked in
