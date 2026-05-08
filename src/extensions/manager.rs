@@ -7302,6 +7302,7 @@ impl ExtensionManager {
                     return Ok(ExtensionSetupSchema {
                         secrets: Vec::new(),
                         fields: Vec::new(),
+                        interactive_login: None,
                     });
                 }
                 Ok(ExtensionSetupSchema {
@@ -7313,6 +7314,7 @@ impl ExtensionManager {
                         provided: true,
                         input_type: crate::tools::wasm::ToolSetupFieldInputType::Password,
                     }],
+                    interactive_login: None,
                 })
             }
             _ => Ok(ExtensionSetupSchema {
