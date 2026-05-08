@@ -332,21 +332,42 @@ async fn alice_job_file_read_for_own_job_succeeds() {
 /// `starts_with(base_canonical)` to enforce containment; this test
 /// pins that guard so a refactor (e.g. switching to `clean()` or a
 /// raw `join` without the starts_with check) regresses loudly.
+///
+/// The directory tree is built by hand instead of via `seed_sandbox_job`
+/// so the planted file lives at exactly `<project_dir>/../outside.txt`.
+/// A regression that allows `..` traversal then deterministically reads
+/// the planted bytes and returns 200, rather than a 404 because the
+/// probe happened to point at empty space.
 #[tokio::test]
 async fn alice_job_file_read_rejects_dotdot_traversal() {
-    let (addr, _state, db, outer) = start_server_with_db().await;
-    let (alice_job_id, alice_proj) = seed_sandbox_job(&db, ALICE_USER_ID).await;
-    // Plant a sibling file OUTSIDE the project dir but INSIDE the same
-    // tempdir tree. A successful `..` traversal would land here.
-    let outside = outer.path().join("outside.txt");
+    let (addr, _state, db, _outer) = start_server_with_db().await;
+
+    let parent = tempfile::tempdir().expect("traversal-parent tempdir");
+    let alice_proj_path = parent.path().join("alice_proj");
+    std::fs::create_dir(&alice_proj_path).expect("create project dir");
+    // Plant the file at exactly `<project_dir>/../outside.txt`. If
+    // canonicalize+starts_with regresses, the handler resolves the
+    // probe to this exact file and returns its content with a 200.
+    let outside = parent.path().join("outside.txt");
     std::fs::write(&outside, "should not be reachable").expect("plant outside file");
 
-    // Compute a relative path from the project dir up to `outside.txt`.
-    // `outer.path()` is the tempdir root for the test fixture; `alice_proj`
-    // is a sibling tempdir under a different root, so we use an absolute
-    // probe instead — `canonicalize()` resolves both the same way and the
-    // `starts_with` check catches the escape regardless.
-    let _ = alice_proj.path(); // keep `alice_proj` alive
+    let alice_job_id = Uuid::new_v4();
+    let job = SandboxJobRecord {
+        id: alice_job_id,
+        task: format!("{ALICE_USER_ID} task"),
+        status: "running".to_string(),
+        user_id: ALICE_USER_ID.to_string(),
+        project_dir: alice_proj_path.to_string_lossy().into_owned(),
+        success: None,
+        failure_reason: None,
+        created_at: Utc::now(),
+        started_at: Some(Utc::now()),
+        completed_at: None,
+        credential_grants_json: "[]".to_string(),
+        mcp_servers: None,
+        max_iterations: None,
+    };
+    db.save_sandbox_job(&job).await.expect("save sandbox job");
 
     let client = reqwest::Client::new();
     let resp = client
@@ -358,10 +379,14 @@ async fn alice_job_file_read_rejects_dotdot_traversal() {
         .unwrap();
 
     let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
     assert!(
         status == 403 || status == 404,
-        "`..` traversal must be rejected; got {status}, body {}",
-        resp.text().await.unwrap_or_default()
+        "`..` traversal must be rejected; got {status}, body {body}"
+    );
+    assert!(
+        !body.contains("should not be reachable"),
+        "planted outside-project bytes leaked through `..` probe; body {body}"
     );
 }
 

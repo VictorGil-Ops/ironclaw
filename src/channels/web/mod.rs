@@ -662,8 +662,14 @@ pub fn dispatch_status_event(
     match user_id.filter(|uid| !uid.is_empty()) {
         Some(uid) => sse.broadcast_for_user(uid, event), // projection-exempt: bridge dispatcher, scoped status update
         None if multi_tenant_mode => {
+            // Log only the wire-stable variant name. `?event` would emit
+            // the full Debug payload, which on variants like
+            // `AppEvent::Response` / `Thinking` / `ToolResult` carries
+            // user-authored content into operator logs in a multi-tenant
+            // deployment. The variant name is enough to chase the
+            // misbehaving producer.
             tracing::warn!(
-                ?event,
+                event_kind = event.event_type(),
                 "dropped unscoped status event in multi-tenant mode — \
                  producer must include a non-empty user_id in metadata"
             );

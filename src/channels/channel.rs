@@ -1202,9 +1202,8 @@ mod tests {
     /// its own metadata back. Reference: PR #3390 follow-up.
     #[test]
     fn with_metadata_preserves_non_string_user_id() {
-        let msg = IncomingMessage::new("telegram", "alice", "hi").with_metadata(
-            serde_json::json!({"user_id": 999, "chat_id": 999, "message_id": 1}),
-        );
+        let msg = IncomingMessage::new("telegram", "alice", "hi")
+            .with_metadata(serde_json::json!({"user_id": 999, "chat_id": 999, "message_id": 1}));
         assert_eq!(
             msg.metadata.get("user_id").and_then(|v| v.as_i64()),
             Some(999),
