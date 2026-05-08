@@ -29,8 +29,7 @@ import httpx
 
 from helpers import api_post, auth_headers
 
-from test_telegram_e2e import (
-    OWNER_USER_ID,
+from .test_telegram_e2e import (
     PAIRED_USER_ID,
     WEBHOOK_SECRET,
     _next_test_update_id,
