@@ -23,13 +23,15 @@ silently come back.
 """
 
 import asyncio
+import json
 import time
 
-import httpx
+import pytest
 
-from helpers import api_post, auth_headers
+from helpers import api_post, sse_stream
 
 from .test_telegram_e2e import (
+    _LOCAL_TELEGRAM_WASM,
     PAIRED_USER_ID,
     WEBHOOK_SECRET,
     _next_test_update_id,
@@ -41,6 +43,93 @@ from .test_telegram_e2e import (
 )
 
 
+async def _send_and_collect_response(
+    base_url: str,
+    *,
+    thread_id: str,
+    content: str,
+    predicate,
+    timeout: float = 30.0,
+) -> str:
+    """Send a chat message and return the matching `response` SSE event.
+
+    `Submission::PairingClaim` is handled by the bridge layer and the reply
+    is delivered through `WebChannel::respond` → `AppEvent::Response` over
+    SSE only — no `Turn` is persisted, so polling `/api/chat/history`
+    cannot see it. The chat-surface tests therefore have to listen on the
+    same event stream the browser/TUI does, and the SSE stream must be
+    open *before* the send so the response event isn't missed in the
+    fan-out window.
+    """
+    matched: list[str] = []
+
+    async def collect():
+        async with sse_stream(base_url, timeout=timeout + 5) as resp:
+            # Note we're connected; the bridge response is broadcast after
+            # this point.
+            collect_started.set()
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    line_bytes = await asyncio.wait_for(
+                        resp.content.readline(), timeout=remaining
+                    )
+                except asyncio.TimeoutError:
+                    break
+                if not line_bytes:
+                    break
+                line = line_bytes.decode("utf-8", errors="replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                try:
+                    event = json.loads(line[5:].strip())
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") != "response":
+                    continue
+                if event.get("thread_id") != thread_id:
+                    continue
+                content_field = event.get("content", "")
+                if predicate(content_field):
+                    matched.append(content_field)
+                    return
+
+    collect_started = asyncio.Event()
+    collector = asyncio.create_task(collect())
+    try:
+        # Wait for the SSE stream to attach so the broadcast doesn't fan
+        # out to zero subscribers before the send completes.
+        await asyncio.wait_for(collect_started.wait(), timeout=10)
+
+        send_r = await api_post(
+            base_url,
+            "/api/chat/send",
+            json={"content": content, "thread_id": thread_id},
+            timeout=30,
+        )
+        assert send_r.status_code in (200, 202), (
+            f"chat send failed ({send_r.status_code}): {send_r.text}"
+        )
+
+        await asyncio.wait_for(collector, timeout=timeout + 5)
+    finally:
+        if not collector.done():
+            collector.cancel()
+            try:
+                await collector
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    assert matched, (
+        f"No matching `response` SSE event arrived within {timeout}s "
+        f"for thread {thread_id}"
+    )
+    return matched[0]
+
+
 async def test_telegram_pairing_reply_names_every_surface(
     isolated_telegram_e2e_server,
 ):
@@ -49,7 +138,21 @@ async def test_telegram_pairing_reply_names_every_surface(
     A regression that drops any of those three surfaces would re-create
     the ambiguity that #3317 surfaced (user pastes code into TUI, no
     handler matches, agent improvises an unhelpful reply).
+
+    The reply text lives inside the Telegram WASM channel binary, so this
+    assertion only runs when a locally-built WASM is available to overlay
+    onto the registry-downloaded artifact. CI workflows that don't build
+    `channels-src/telegram/` skip this scenario; the canary lane in
+    `scripts/live_canary/auth_registry.py` covers the same wording
+    against the deployed binary.
     """
+    if not _LOCAL_TELEGRAM_WASM.exists():
+        pytest.skip(
+            "Locally-built Telegram WASM not present at "
+            f"{_LOCAL_TELEGRAM_WASM} — pairing-reply wording asserts "
+            "source-tree text and can't be exercised against the registry "
+            "artifact."
+        )
     base_url = isolated_telegram_e2e_server["base_url"]
     http_url = isolated_telegram_e2e_server["http_url"]
     fake_tg_url = isolated_telegram_e2e_server["fake_tg_url"]
@@ -159,49 +262,18 @@ async def test_chat_surface_approves_pairing_code(
     thread_r.raise_for_status()
     thread_id = thread_r.json()["id"]
 
-    send_r = await api_post(
+    pairing_response = await _send_and_collect_response(
         base_url,
-        "/api/chat/send",
-        json={
-            "content": f"approve telegram {code}",
-            "thread_id": thread_id,
-        },
+        thread_id=thread_id,
+        content=f"approve telegram {code}",
+        predicate=lambda c: (
+            "Pairing approved" in c
+            or "Pairing was approved" in c
+            or "Invalid or expired pairing code" in c
+        ),
         timeout=30,
     )
-    assert send_r.status_code in (200, 202), (
-        f"chat send for pairing claim failed ({send_r.status_code}): {send_r.text}"
-    )
 
-    # Wait for the chat handler to produce the pairing-claim response.
-    deadline = time.monotonic() + 30
-    pairing_response = None
-    async with httpx.AsyncClient() as client:
-        while time.monotonic() < deadline:
-            history = await client.get(
-                f"{base_url}/api/chat/history",
-                params={"thread_id": thread_id},
-                headers=auth_headers(),
-                timeout=15,
-            )
-            history.raise_for_status()
-            data = history.json()
-            for turn in data.get("turns", []):
-                response = turn.get("response", "")
-                if response and (
-                    "Pairing approved" in response
-                    or "Pairing was approved" in response
-                    or "Invalid or expired pairing code" in response
-                ):
-                    pairing_response = response
-                    break
-            if pairing_response:
-                break
-            await asyncio.sleep(0.5)
-
-    assert pairing_response, (
-        f"Pairing claim through chat did not produce a recognizable response "
-        f"within 30s for thread {thread_id}"
-    )
     assert "Pairing approved" in pairing_response, (
         f"Expected successful pairing, got: {pairing_response}"
     )
@@ -271,38 +343,14 @@ async def test_chat_surface_rejects_invalid_pairing_code(
     thread_r.raise_for_status()
     thread_id = thread_r.json()["id"]
 
-    send_r = await api_post(
+    invalid_response = await _send_and_collect_response(
         base_url,
-        "/api/chat/send",
-        json={
-            "content": "approve telegram NOSUCHCODE99",
-            "thread_id": thread_id,
-        },
+        thread_id=thread_id,
+        content="approve telegram NOSUCHCODE99",
+        predicate=lambda c: "Invalid or expired pairing code" in c,
         timeout=30,
     )
-    assert send_r.status_code in (200, 202)
 
-    deadline = time.monotonic() + 30
-    invalid_response = None
-    async with httpx.AsyncClient() as client:
-        while time.monotonic() < deadline:
-            history = await client.get(
-                f"{base_url}/api/chat/history",
-                params={"thread_id": thread_id},
-                headers=auth_headers(),
-                timeout=15,
-            )
-            history.raise_for_status()
-            for turn in history.json().get("turns", []):
-                response = turn.get("response", "")
-                if response and "Invalid or expired pairing code" in response:
-                    invalid_response = response
-                    break
-            if invalid_response:
-                break
-            await asyncio.sleep(0.5)
-
-    assert invalid_response, (
-        f"Invalid pairing claim must surface a clear rejection "
-        f"within 30s for thread {thread_id}"
+    assert "Invalid or expired pairing code" in invalid_response, (
+        f"Invalid pairing claim must surface a clear rejection, got: {invalid_response}"
     )
