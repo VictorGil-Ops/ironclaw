@@ -644,22 +644,28 @@ pub const GATEWAY_CHANNEL_NAME: &str = "gateway";
 /// producer gets fixed. Single-tenant deployments keep the unscoped
 /// fan-out because there is only one subscriber population.
 ///
+/// An empty-string `user_id` is treated the same as `None` — empty
+/// values typically come from a producer that lost the field along the
+/// way (default-initialised structs, missing JSON keys converted to
+/// empty strings) and must not collapse into a global broadcast in
+/// multi-tenant mode.
+///
 /// Extracted from `Channel::send_status` so the routing rule can be
 /// asserted by unit tests without standing up a `GatewayChannel`. See
 /// `tests::status_event_isolation`.
-pub(crate) fn dispatch_status_event(
+pub fn dispatch_status_event(
     sse: &platform::sse::SseManager,
     multi_tenant_mode: bool,
     user_id: Option<&str>,
     event: AppEvent,
 ) {
-    match user_id {
+    match user_id.filter(|uid| !uid.is_empty()) {
         Some(uid) => sse.broadcast_for_user(uid, event), // projection-exempt: bridge dispatcher, scoped status update
         None if multi_tenant_mode => {
             tracing::warn!(
                 ?event,
                 "dropped unscoped status event in multi-tenant mode — \
-                 producer must include user_id in metadata"
+                 producer must include a non-empty user_id in metadata"
             );
         }
         None => {

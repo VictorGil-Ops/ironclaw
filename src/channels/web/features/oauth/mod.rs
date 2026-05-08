@@ -70,6 +70,39 @@ fn redact_oauth_state_for_logs(state: &str) -> String {
     format!("sha256:{short_hash}:len={}", state.len())
 }
 
+/// Resolve the IronClaw user who initiated a Slack relay OAuth flow.
+///
+/// `auth_channel_relay` (in `extensions/manager.rs`) stores the
+/// initiating user_id under `relay:{name}:oauth_user`, namespaced by
+/// the *gateway owner* secret-store user (`owner_id`). The callback
+/// handler reads it back here so the completion toast can be
+/// broadcast to the actual tenant who started the flow rather than
+/// the gateway owner — in multi-tenant deployments those differ, and
+/// broadcasting to `owner_id` would deliver the success/failure
+/// toast to the wrong browser tab.
+///
+/// Falls back to `owner_id` when the secret is missing
+/// (single-tenant deployments or flows started before the field was
+/// stored). Returns the resolved user_id as a `String` so the caller
+/// owns the value past the secret store's lifetime.
+///
+/// This helper is the canonical broadcast-target resolver. The
+/// pairing-identity creation path also uses it so the toast and the
+/// new identity always agree on which user just completed the flow.
+async fn resolve_relay_oauth_user(
+    secrets: &(dyn crate::secrets::SecretsStore + Send + Sync),
+    owner_id: &str,
+    extension_name: &str,
+) -> String {
+    let user_key = format!("relay:{extension_name}:oauth_user");
+    secrets
+        .get_decrypted(owner_id, &user_key)
+        .await
+        .ok()
+        .map(|s| s.expose().to_string())
+        .unwrap_or_else(|| owner_id.to_string())
+}
+
 /// OAuth callback handler for the web gateway.
 ///
 /// This is a PUBLIC route (no Bearer token required) because OAuth providers
@@ -709,6 +742,19 @@ pub(crate) async fn slack_relay_oauth_callback_handler(
         .into_response();
     }
 
+    // Resolve the IronClaw user who initiated this OAuth flow BEFORE the
+    // result block so the completion toast can be routed to that tenant
+    // even on the failure path. The same `relay:{ext}:oauth_user` secret
+    // is also consumed inside the success path to create the pairing
+    // identity; that delete is the cleanup, this read is the broadcast
+    // target.
+    let oauth_user = resolve_relay_oauth_user(
+        ext_mgr.secrets().as_ref(),
+        &state.owner_id,
+        &relay_extension_name,
+    )
+    .await;
+
     let result: Result<(), String> = async {
         let store = state.store.as_ref().ok_or_else(|| {
             "Relay activation requires persistent settings storage; no-db mode is unsupported."
@@ -778,14 +824,14 @@ pub(crate) async fn slack_relay_oauth_callback_handler(
                     "No connection with authed_user_id found for this team".to_string()
                 })?;
 
+            // The outer `oauth_user` (resolved by `resolve_relay_oauth_user`
+            // above the result block) is the IronClaw user this OAuth flow
+            // belongs to. Reuse it here so the pairing identity and the
+            // completion toast always agree on the target tenant.
+            // Cleanup of the temporary secret happens regardless of
+            // whether `create_identity` later succeeds, so a failure
+            // doesn't leave the credential lingering.
             let user_key = format!("relay:{}:oauth_user", relay_extension_name);
-            let oauth_user = ext_mgr
-                .secrets()
-                .get_decrypted(&state.owner_id, &user_key)
-                .await
-                .ok()
-                .map(|s| s.expose().to_string())
-                .unwrap_or_else(|| state.owner_id.clone());
             let _ = ext_mgr.secrets().delete(&state.owner_id, &user_key).await;
 
             let user_record = if let Some(ref db) = state.store {
@@ -841,9 +887,13 @@ pub(crate) async fn slack_relay_oauth_callback_handler(
         }
     };
 
-    // Broadcast event to notify the web UI. Scope to the OAuth flow owner —
-    // a global broadcast would surface another tenant's "Slack connected"
-    // toast to every connected browser tab.
+    // Broadcast event to notify the web UI. Scope to the resolved
+    // OAuth flow user (`oauth_user`) rather than `state.owner_id` —
+    // in multi-tenant mode a non-owner can complete a Slack OAuth
+    // flow, and the completion toast must reach THAT user's open
+    // browser tab, not the gateway owner's. Broadcasting to
+    // `state.owner_id` was a cross-tenant misroute even after the
+    // global-broadcast leak was closed.
     let onboarding_event = AppEvent::OnboardingState {
         extension_name: ironclaw_common::ExtensionName::from_trusted(relay_extension_name.clone()),
         state: if success {
@@ -859,9 +909,7 @@ pub(crate) async fn slack_relay_oauth_callback_handler(
         onboarding: None,
         thread_id: None,
     };
-    state
-        .sse
-        .broadcast_for_user(&state.owner_id, onboarding_event); // projection-exempt: channel-lifecycle, slack relay onboarding state
+    state.sse.broadcast_for_user(&oauth_user, onboarding_event); // projection-exempt: channel-lifecycle, slack relay onboarding state
 
     if success {
         axum::response::Html(
@@ -911,6 +959,55 @@ mod tests {
     };
 
     use crate::testing::credentials::TEST_GATEWAY_CRYPTO_KEY;
+
+    /// `auth_channel_relay` stores the initiating user_id under
+    /// `relay:{ext}:oauth_user` namespaced by the GATEWAY OWNER's
+    /// secret-store user. The callback must read it back from the same
+    /// namespace and return it — broadcasting the completion toast to
+    /// `state.owner_id` instead would deliver the success/failure
+    /// notification to the wrong tenant in multi-tenant deployments.
+    #[tokio::test]
+    async fn resolve_relay_oauth_user_returns_stored_value() {
+        use crate::secrets::CreateSecretParams;
+
+        let secrets = test_secrets_store();
+        let owner_id = "gateway-owner";
+        let extension_name = DEFAULT_RELAY_NAME;
+        let initiating_user = "alice"; // deliberately != owner_id
+
+        secrets
+            .create(
+                owner_id,
+                CreateSecretParams::new(
+                    format!("relay:{extension_name}:oauth_user"),
+                    initiating_user,
+                ),
+            )
+            .await
+            .expect("seed oauth_user secret"); // safety: cfg(test) fixture
+
+        let resolved =
+            super::resolve_relay_oauth_user(secrets.as_ref(), owner_id, extension_name).await;
+        assert_eq!(
+            resolved, initiating_user,
+            "callback must broadcast to the initiating user, not the gateway owner"
+        );
+    }
+
+    /// Falls back to `owner_id` when the secret was never written —
+    /// covers single-tenant deployments and pre-multi-tenant flows.
+    #[tokio::test]
+    async fn resolve_relay_oauth_user_falls_back_to_owner_id() {
+        let secrets = test_secrets_store();
+        let owner_id = "single-tenant-owner";
+
+        let resolved =
+            super::resolve_relay_oauth_user(secrets.as_ref(), owner_id, DEFAULT_RELAY_NAME).await;
+        assert_eq!(
+            resolved, owner_id,
+            "missing secret must fall back to owner_id, not panic or empty-string"
+        );
+    }
 
     fn test_oauth_router(state: Arc<GatewayState>) -> Router {
         Router::new()

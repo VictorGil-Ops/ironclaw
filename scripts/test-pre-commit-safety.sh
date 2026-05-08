@@ -187,6 +187,26 @@ assert_filtered "MULTITENANT: heartbeat (transport-only) is exempt" \
     "$MT_POS" \
     "$MT_NEG"
 
+# Receiver-prefixed call sites: the boundary regex matches `.sse.broadcast(`
+# because the leading `.` is non-alnum-and-non-underscore, so the existing
+# check covers production patterns like `state.sse.broadcast(`,
+# `gw_state.sse.broadcast(`, and rustfmt-wrapped chains. These tests pin
+# that behaviour against a future regex tightening.
+assert_flagged "MULTITENANT: state.sse.broadcast (receiver-prefixed) is flagged" \
+    "+    state.sse.broadcast(event);" \
+    "$MT_POS" \
+    "$MT_NEG"
+
+assert_flagged "MULTITENANT: gw_state.sse.broadcast (snake_case receiver) is flagged" \
+    "+    gw_state.sse.broadcast(event);" \
+    "$MT_POS" \
+    "$MT_NEG"
+
+assert_filtered "MULTITENANT: state.sse.broadcast with annotation is exempt" \
+    "+    state.sse.broadcast(event); // multi-tenant-safe: single-tenant fallback" \
+    "$MT_POS" \
+    "$MT_NEG"
+
 assert_filtered "MULTITENANT: explicit multi-tenant-safe annotation is exempt" \
     "+    sse.broadcast(event); // multi-tenant-safe: only reached when multi_tenant_mode=false" \
     "$MT_POS" \

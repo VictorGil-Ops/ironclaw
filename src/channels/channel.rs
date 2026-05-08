@@ -136,8 +136,10 @@ impl IncomingMessage {
     /// `GatewayChannel::send_status` for SSE/WS event routing) has the
     /// owning tenant identity even when the producer never calls
     /// [`Self::with_metadata`]. Producers replacing metadata wholesale
-    /// should prefer [`Self::with_metadata`], which preserves the
-    /// `user_id` key on the supplied object.
+    /// should prefer [`Self::with_metadata`], which **always** overwrites
+    /// the `user_id` key on the supplied object with `self.user_id` —
+    /// caller-supplied values are dropped to keep the SSE recipient
+    /// scope unforgeable.
     pub fn new(
         channel: impl Into<String>,
         user_id: impl Into<String>,
@@ -245,22 +247,29 @@ impl IncomingMessage {
 
     /// Set metadata.
     ///
-    /// Preserves `metadata.user_id` so the gateway's status routing can
-    /// scope SSE/WS events to the owning tenant. Callers passing a
-    /// non-object value (`Null`, array, scalar) get an object substituted
-    /// with `user_id` populated from `self.user_id`. Callers passing an
-    /// object that lacks `user_id` get it inserted; callers that want a
-    /// different `user_id` keep their explicit value (rare — typically a
-    /// proactive broadcast forwarding to a different tenant).
+    /// `metadata.user_id` is **always** overwritten with `self.user_id`
+    /// — caller-supplied values are dropped. This makes the SSE/WS
+    /// recipient scope unforgeable from channel metadata: a WASM
+    /// extension whose emitted JSON contains `{"user_id":"victim"}`
+    /// (intentionally or via bug) cannot route a later `ToolStarted` /
+    /// `ToolResult` event into another tenant's stream. Non-object
+    /// inputs (`Null`, array, scalar) are replaced with a fresh object
+    /// carrying `self.user_id`.
+    ///
+    /// If a caller legitimately needs to forward to a different tenant
+    /// (e.g. a proactive broadcast) it must mint a separate
+    /// `IncomingMessage` with the target `user_id` rather than
+    /// hand-rolling the metadata field.
     pub fn with_metadata(mut self, metadata: serde_json::Value) -> Self {
-        let user_id = self.user_id.clone();
         let mut metadata = match metadata {
             serde_json::Value::Object(_) => metadata,
             _ => serde_json::json!({}),
         };
         if let Some(obj) = metadata.as_object_mut() {
-            obj.entry("user_id".to_string())
-                .or_insert_with(|| serde_json::json!(user_id));
+            obj.insert(
+                "user_id".to_string(),
+                serde_json::Value::String(self.user_id.clone()),
+            );
         }
         self.metadata = metadata;
         self
@@ -1134,6 +1143,40 @@ mod tests {
     fn test_incoming_message_with_timezone() {
         let msg = IncomingMessage::new("test", "user1", "hello").with_timezone("America/New_York");
         assert_eq!(msg.timezone.as_deref(), Some("America/New_York"));
+    }
+
+    /// Regression: a WASM channel that emits metadata containing a
+    /// foreign `user_id` must NOT be able to override the message's
+    /// owner. `apply_emitted_metadata` in the WASM wrapper feeds parsed
+    /// JSON straight into `with_metadata`; if a malicious or buggy
+    /// extension supplies `{"user_id":"victim"}`, downstream
+    /// `send_status` would route ToolStarted/ToolResult into the
+    /// victim's SSE stream. `with_metadata` must clobber the field.
+    #[test]
+    fn with_metadata_overwrites_caller_supplied_user_id() {
+        let msg = IncomingMessage::new("wasm_channel", "alice", "hi")
+            .with_metadata(serde_json::json!({"user_id": "bob", "chat_id": 42}));
+        assert_eq!(
+            msg.metadata.get("user_id").and_then(|v| v.as_str()),
+            Some("alice"),
+            "with_metadata must drop caller-supplied user_id and use the message's own"
+        );
+        // Other caller fields survive.
+        assert_eq!(
+            msg.metadata.get("chat_id").and_then(|v| v.as_i64()),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn with_metadata_replaces_non_object_with_owner_user_id() {
+        let msg =
+            IncomingMessage::new("test", "alice", "hi").with_metadata(serde_json::Value::Null);
+        assert_eq!(
+            msg.metadata.get("user_id").and_then(|v| v.as_str()),
+            Some("alice"),
+            "non-object metadata must be replaced with an object carrying user_id"
+        );
     }
 
     #[test]
