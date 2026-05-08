@@ -89,10 +89,18 @@ impl OauthCallbackFailure {
     }
 }
 
-/// Generate a short correlation ID from the redacted state fingerprint plus
-/// the current monotonic-ish timestamp. Emitted on every `tracing::warn!`
-/// call in the OAuth callback failure paths so an operator can map a
-/// timestamp / category / state fingerprint cluster to a single log line.
+/// Generate a short correlation ID from an arbitrary seed plus the current
+/// monotonic-ish timestamp. Emitted on every `tracing::warn!` call in the
+/// OAuth callback failure paths so an operator can map a timestamp /
+/// category / correlation cluster to a single log line.
+///
+/// The seed is whatever caller-side string best identifies the failure —
+/// in practice the raw `state` query parameter (when present) or the
+/// `flow.extension_name` for post-state-resolution failures. The seed is
+/// hashed (SHA-256) before any hex output, so it is never logged or
+/// exposed verbatim through the returned ID; callers that want the seed
+/// itself in logs must pass it separately through
+/// [`redact_oauth_state_for_logs`].
 ///
 /// Currently logs-only: the user-facing landing page rendered by
 /// [`oauth_error_page`] uses [`crate::auth::oauth::landing_html`], which has
