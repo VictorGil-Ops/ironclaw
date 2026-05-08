@@ -4,9 +4,9 @@ use crate::config::helpers::{
     db_first_bool, db_first_optional_string, optional_env, validate_operator_base_url,
 };
 use crate::error::ConfigError;
-use crate::llm::config::LlmConfig;
-use crate::llm::registry::ProviderProtocol;
 use crate::settings::Settings;
+use ironclaw_llm::config::LlmConfig;
+use ironclaw_llm::registry::ProviderProtocol;
 
 /// Configuration for built-in image generation, editing, and analysis tools.
 ///
@@ -96,14 +96,14 @@ impl ImageConfig {
         let explicit_model = db_first_optional_string(&settings.image.model, "IMAGE_MODEL")?;
         let model = explicit_model.or_else(|| {
             let models = vec![active_model.clone()];
-            crate::llm::image_models::suggest_image_model(&models).map(str::to_string)
+            ironclaw_llm::image_models::suggest_image_model(&models).map(str::to_string)
         });
 
         let explicit_vision_model =
             db_first_optional_string(&settings.image.vision_model, "IMAGE_VISION_MODEL")?;
         let vision_model = explicit_vision_model.or_else(|| {
             let models = vec![active_model];
-            crate::llm::vision_models::suggest_vision_model(&models).map(str::to_string)
+            ironclaw_llm::vision_models::suggest_vision_model(&models).map(str::to_string)
         });
 
         Ok(Self {
@@ -165,8 +165,8 @@ mod tests {
 
     use super::*;
     use crate::config::helpers::lock_env;
-    use crate::llm::config::{CacheRetention, NearAiConfig, RegistryProviderConfig};
-    use crate::llm::session::SessionConfig;
+    use ironclaw_llm::config::{CacheRetention, NearAiConfig, RegistryProviderConfig};
+    use ironclaw_llm::session::SessionConfig;
 
     fn nearai_llm(api_key: Option<&str>, model: &str) -> LlmConfig {
         LlmConfig {
