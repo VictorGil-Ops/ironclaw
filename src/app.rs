@@ -16,14 +16,14 @@ use crate::context::ContextManager;
 use crate::db::{Database, UserStore};
 use crate::extensions::ExtensionManager;
 use crate::hooks::HookRegistry;
-use crate::llm::recording::HttpInterceptor;
-use crate::llm::{LlmProvider, LlmReloadHandle, RecordingLlm, SessionManager};
 use crate::secrets::SecretsStore;
 use crate::tools::ToolRegistry;
 use crate::tools::mcp::{McpClient, McpProcessManager, McpServerConfig, McpSessionManager};
 use crate::tools::wasm::SharedCredentialRegistry;
 use crate::tools::wasm::WasmToolRuntime;
 use crate::workspace::{EmbeddingCacheConfig, EmbeddingProvider, Workspace};
+use ironclaw_llm::recording::HttpInterceptor;
+use ironclaw_llm::{LlmProvider, LlmReloadHandle, RecordingLlm, SessionManager};
 use ironclaw_safety::SafetyLayer;
 use ironclaw_skills::SkillRegistry;
 use ironclaw_skills::catalog::SkillCatalog;
@@ -409,8 +409,10 @@ impl AppBuilder {
             }
         }
 
+        let session_db: ironclaw_llm::host::SharedSessionDb =
+            std::sync::Arc::new(crate::llm_host::DatabaseSessionDb::new(db.clone()));
         self.session
-            .attach_store(db.clone(), &self.config.owner_id)
+            .attach_store(session_db, &self.config.owner_id)
             .await;
 
         // Fire-and-forget housekeeping — no need to block startup.
@@ -593,7 +595,10 @@ impl AppBuilder {
 
             // Wire the secrets store into the session manager so future
             // token saves go to encrypted storage.
-            self.session.attach_secrets(Arc::clone(secrets)).await;
+            let session_secrets: ironclaw_llm::host::SharedSessionSecrets = Arc::new(
+                crate::llm_host::SecretsStoreSessionSecrets::new(Arc::clone(secrets)),
+            );
+            self.session.attach_secrets(session_secrets).await;
         }
 
         self.secrets_store = store;
@@ -664,7 +669,7 @@ impl AppBuilder {
         anyhow::Error,
     > {
         let (llm, cheap_llm, recording_handle, reload_handle) =
-            crate::llm::build_provider_chain(&self.config.llm, self.session.clone()).await?;
+            ironclaw_llm::build_provider_chain(&self.config.llm, self.session.clone()).await?;
         Ok((llm, cheap_llm, recording_handle, reload_handle))
     }
 
@@ -831,13 +836,13 @@ impl AppBuilder {
                     .map(|p| p.model.clone())
                     .unwrap_or_else(|| self.config.llm.nearai.model.clone());
                 let models = vec![model_name.clone()];
-                let gen_model = crate::llm::image_models::suggest_image_model(&models)
+                let gen_model = ironclaw_llm::image_models::suggest_image_model(&models)
                     .unwrap_or("black-forest-labs/FLUX.2-klein-4B")
                     .to_string();
                 tools.register_image_tools(api_base.clone(), api_key.clone(), gen_model, None);
 
                 // Check for vision models
-                let vision_model = crate::llm::vision_models::suggest_vision_model(&models)
+                let vision_model = ironclaw_llm::vision_models::suggest_vision_model(&models)
                     .unwrap_or(&model_name)
                     .to_string();
                 tools.register_vision_tools(api_base, api_key, vision_model, None);
@@ -875,6 +880,7 @@ impl AppBuilder {
         tools: &Arc<ToolRegistry>,
         hooks: &Arc<HookRegistry>,
         settings_store_override: Option<Arc<dyn crate::db::SettingsStore + Send + Sync>>,
+        ownership_cache: Arc<crate::ownership::OwnershipCache>,
     ) -> Result<
         (
             Arc<McpSessionManager>,
@@ -1202,6 +1208,13 @@ impl AppBuilder {
             if let Some(ref ss) = settings_store_override {
                 em = em.with_settings_store(Arc::clone(ss));
             }
+            if let Some(ref db) = self.db {
+                let ps = Arc::new(crate::pairing::PairingStore::new(
+                    Arc::clone(db),
+                    Arc::clone(&ownership_cache),
+                ));
+                em = em.with_pairing_store(ps);
+            }
             let manager = Arc::new(em);
             tools.register_extension_tools(Arc::clone(&manager));
 
@@ -1402,6 +1415,7 @@ impl AppBuilder {
             _ => (None, None),
         };
 
+        let ownership_cache = Arc::new(crate::ownership::OwnershipCache::new());
         let (
             mcp_session_manager,
             mcp_process_manager,
@@ -1411,7 +1425,12 @@ impl AppBuilder {
             dev_loaded_tool_names,
             background_tasks,
         ) = self
-            .init_extensions(&tools, &hooks, settings_store.clone())
+            .init_extensions(
+                &tools,
+                &hooks,
+                settings_store.clone(),
+                Arc::clone(&ownership_cache),
+            )
             .await?;
 
         // Load bootstrap-completed flag from settings so that existing users
@@ -1555,7 +1574,7 @@ impl AppBuilder {
             catalog_entries,
             dev_loaded_tool_names,
             builder,
-            ownership_cache: Arc::new(crate::ownership::OwnershipCache::new()),
+            ownership_cache,
             background_tasks,
         })
     }
