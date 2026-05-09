@@ -4501,6 +4501,7 @@ name = "ironclaw_reborn"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "ironclaw",
  "ironclaw_host_api",
  "ironclaw_loop_support",
@@ -4508,6 +4509,8 @@ dependencies = [
  "ironclaw_turns",
  "rust_decimal",
  "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -8749,6 +8752,7 @@ dependencies = [
  "futures-core",
  "futures-io",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

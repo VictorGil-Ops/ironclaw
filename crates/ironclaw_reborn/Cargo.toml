@@ -20,11 +20,15 @@ ironclaw = { path = "../..", version = "0.28.0", optional = true, default-featur
 ironclaw_loop_support = { path = "../ironclaw_loop_support", version = "0.1.0" }
 ironclaw_threads = { path = "../ironclaw_threads", version = "0.1.0" }
 ironclaw_turns = { path = "../ironclaw_turns", version = "0.1.0" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
 
 [dev-dependencies]
+chrono = "0.4"
 ironclaw_host_api = { path = "../ironclaw_host_api", version = "0.1.0" }
 rust_decimal = "1"
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 
 [[test]]
 name = "llm_gateway"
