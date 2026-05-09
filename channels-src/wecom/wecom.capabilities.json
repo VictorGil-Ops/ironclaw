@@ -16,13 +16,13 @@
     "required_secrets": [
       {
         "name": "wecom_bot_id",
-        "prompt": "Enter your WeCom Bot ID",
+        "prompt": "Enter the BotId from your WeCom intelligent bot settings.",
         "validation": "^[A-Za-z0-9_-]{3,128}$",
         "optional": false
       },
       {
         "name": "wecom_bot_secret",
-        "prompt": "Enter your WeCom Bot Secret",
+        "prompt": "Enter the Secret from your WeCom intelligent bot settings.",
         "validation": "^[A-Za-z0-9_-]{16,128}$",
         "optional": false
       }
