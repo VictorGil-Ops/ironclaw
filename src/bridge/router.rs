@@ -1079,6 +1079,12 @@ async fn execute_pending_gate_action(
         step_id: ironclaw_engine::StepId::new(),
         current_call_id: Some(resolved_call_id.clone()),
         source_channel: Some(pending.source_channel.clone()),
+        source_conversation_thread_id: thread
+            .metadata
+            .get("source_conversation_thread_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+            .map(ironclaw_engine::ThreadId),
         user_timezone: thread
             .metadata
             .get("user_timezone")
@@ -4146,6 +4152,12 @@ pub(crate) async fn handle_mission_notification(
     // (channel target) different from the mission's owning user.
     let broadcast_user = notif.notify_user.as_deref().unwrap_or(&notif.user_id);
 
+    // Prefer the originating conversation thread when present so results land
+    // in the chat where the user fired the mission. Fall back to the mission's
+    // own execution thread for cron-only / API-imported / learning missions
+    // that have no parent conversation.
+    let target_thread = notif.parent_thread_id.unwrap_or(notif.thread_id);
+
     for channel_name in &notif.notify_channels {
         // Send via channel broadcast (proactive, no incoming message required)
         let mut response = OutgoingResponse::text(&full_text);
@@ -4154,7 +4166,7 @@ pub(crate) async fn handle_mission_notification(
         // so the gateway's broadcast() fallback resolves the recipient's own
         // assistant thread — avoids leaking the owner's thread_id cross-user.
         if broadcast_user == notif.user_id {
-            response = response.in_thread(notif.thread_id.to_string());
+            response = response.in_thread(target_thread.to_string());
         }
         if let Err(e) = channels
             .broadcast(channel_name, broadcast_user, response)
@@ -4174,22 +4186,40 @@ pub(crate) async fn handle_mission_notification(
             &notif.user_id,
             AppEvent::Response {
                 content: full_text.clone(),
-                thread_id: notif.thread_id.to_string(),
+                thread_id: target_thread.to_string(),
             },
         );
     }
 
     // Write to v1 DB so the history API shows the mission result.
-    // Use the "assistant" conversation for the user on the first notify channel.
+    //
+    // V1 conversation_id is the same UUID as the v2 thread_id for chat-spawned
+    // threads (the chat URL `#/chat/<id>` queries `conversation_messages WHERE
+    // conversation_id = <id>` directly). When the mission has a parent
+    // conversation thread, write the result there so the user sees it in the
+    // chat where they fired the mission. Otherwise — or if that write fails
+    // (e.g. the parent v1 row was deleted) — fall back to the user's
+    // assistant conversation so cron/learning missions and edge-case
+    // failures still surface their output somewhere visible.
     if let Some(db) = db
         && let Some(channel_name) = notif.notify_channels.first()
-        && let Ok(conv_id) = db
-            .get_or_create_assistant_conversation(&notif.user_id, channel_name)
-            .await
     {
-        let _ = db
-            .add_conversation_message(conv_id, "assistant", &full_text)
-            .await;
+        let parent_write_succeeded = if let Some(parent) = notif.parent_thread_id {
+            db.add_conversation_message(parent.0, "assistant", &full_text)
+                .await
+                .is_ok()
+        } else {
+            false
+        };
+        if !parent_write_succeeded
+            && let Ok(conv_id) = db
+                .get_or_create_assistant_conversation(&notif.user_id, channel_name)
+                .await
+        {
+            let _ = db
+                .add_conversation_message(conv_id, "assistant", &full_text)
+                .await;
+        }
     }
 
     // Inject the mission output into each notify channel's v2 conversation
@@ -4207,7 +4237,7 @@ pub(crate) async fn handle_mission_notification(
                     if let Err(e) = conv_mgr
                         .record_external_agent_message(
                             conv_id,
-                            notif.thread_id,
+                            target_thread,
                             &notif.user_id,
                             full_text.clone(),
                         )

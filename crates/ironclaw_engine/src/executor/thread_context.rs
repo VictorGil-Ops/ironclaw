@@ -1,6 +1,6 @@
 use crate::traits::effect::ThreadExecutionContext;
 use crate::types::step::StepId;
-use crate::types::thread::Thread;
+use crate::types::thread::{Thread, ThreadId};
 use ironclaw_common::ValidTimezone;
 
 /// Build an execution context from the current thread state.
@@ -21,6 +21,12 @@ pub(crate) fn thread_execution_context(
             .get("source_channel")
             .and_then(|v| v.as_str())
             .map(str::to_string),
+        source_conversation_thread_id: thread
+            .metadata
+            .get("source_conversation_thread_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+            .map(ThreadId),
         user_timezone: thread
             .metadata
             .get("user_timezone")

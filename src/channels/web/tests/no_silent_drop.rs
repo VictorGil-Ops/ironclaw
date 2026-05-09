@@ -206,6 +206,7 @@ async fn mission_notification_cross_user_does_not_leak_owner_thread_id() {
         mission_id: ironclaw_engine::MissionId(uuid::Uuid::new_v4()),
         mission_name: "test-mission".to_string(),
         thread_id: ironclaw_engine::ThreadId(uuid::Uuid::new_v4()),
+        parent_thread_id: None,
         user_id: "owner-user".to_string(),
         notify_channels: vec!["gateway".to_string()],
         notify_user: Some("other-user".to_string()),
@@ -281,6 +282,7 @@ async fn mission_notification_same_user_attaches_owner_thread_id() {
         mission_id: ironclaw_engine::MissionId(uuid::Uuid::new_v4()),
         mission_name: "test-mission".to_string(),
         thread_id: ironclaw_engine::ThreadId(uuid::Uuid::new_v4()),
+        parent_thread_id: None,
         user_id: "test-user".to_string(),
         notify_channels: vec!["gateway".to_string()],
         notify_user: None, // owner IS the recipient
@@ -348,6 +350,7 @@ async fn mission_notification_explicit_same_user_attaches_owner_thread_id() {
         mission_id: ironclaw_engine::MissionId(uuid::Uuid::new_v4()),
         mission_name: "test-mission".to_string(),
         thread_id: ironclaw_engine::ThreadId(uuid::Uuid::new_v4()),
+        parent_thread_id: None,
         user_id: "test-user".to_string(),
         notify_channels: vec!["gateway".to_string()],
         // Explicitly set to same user — guard must still attach thread_id
@@ -373,5 +376,230 @@ async fn mission_notification_explicit_same_user_attaches_owner_thread_id() {
     assert_eq!(
         thread_id, owner_thread_id,
         "explicit notify_user == user_id should still attach the owner's thread_id"
+    );
+}
+
+/// Regression: when `parent_thread_id` is set on the notification, the SSE
+/// `Response` event MUST carry the parent (originating conversation) thread,
+/// not the mission's internal execution thread. Otherwise mission output
+/// gets persisted under a thread the user can't navigate to and is invisible
+/// from the conversation where they fired the mission.
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn mission_notification_routes_to_parent_thread_when_set() {
+    use crate::channels::ChannelManager;
+    use crate::db::Database;
+    use futures::StreamExt;
+    use ironclaw_common::AppEvent;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test_parent_thread_routing.db");
+    let backend = crate::db::libsql::LibSqlBackend::new_local(&db_path)
+        .await
+        .unwrap();
+    Database::run_migrations(&backend).await.unwrap();
+    let store: Arc<dyn Database> = Arc::new(backend);
+
+    let gw = test_gateway().with_store(store.clone());
+    let sse = Arc::clone(&gw.state.sse);
+
+    let mut stream = sse
+        .subscribe_raw(Some("test-user".to_string()), false)
+        .expect("subscribe should succeed");
+
+    let mgr = ChannelManager::new();
+    mgr.add(Box::new(gw)).await;
+    let channels = Arc::new(mgr);
+
+    let parent = ironclaw_engine::ThreadId(uuid::Uuid::new_v4());
+    let execution_thread = ironclaw_engine::ThreadId(uuid::Uuid::new_v4());
+
+    let notif = ironclaw_engine::MissionNotification {
+        mission_id: ironclaw_engine::MissionId(uuid::Uuid::new_v4()),
+        mission_name: "test-mission".to_string(),
+        thread_id: execution_thread,
+        parent_thread_id: Some(parent),
+        user_id: "test-user".to_string(),
+        notify_channels: vec!["gateway".to_string()],
+        notify_user: None,
+        response: Some("mission result".to_string()),
+        is_error: false,
+    };
+
+    crate::bridge::handle_mission_notification(&notif, &channels, Some(&sse), Some(&store), None)
+        .await;
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+        .await
+        .expect("should receive SSE event within 1s")
+        .expect("stream should not be empty");
+
+    let AppEvent::Response { thread_id, .. } = event else {
+        panic!("expected AppEvent::Response, got: {event:?}");
+    };
+
+    assert_eq!(
+        thread_id,
+        parent.to_string(),
+        "mission output must route to the originating conversation thread, \
+         not to the mission's internal execution thread"
+    );
+    assert_ne!(
+        thread_id,
+        execution_thread.to_string(),
+        "execution thread must NOT be exposed when a parent thread is set"
+    );
+}
+
+/// Regression: when `parent_thread_id` is set, the v1 `add_conversation_message`
+/// write MUST go to the parent conversation's row — NOT to the user's
+/// assistant conversation. Otherwise the chat history endpoint
+/// (`list_conversation_messages_paginated`) returns the mission output for
+/// the assistant conversation regardless of which chat thread the user opens,
+/// causing every viewer of the assistant thread to see every user mission's
+/// output. This is the persistent layer of the bug — SSE filtering alone
+/// doesn't fix it because the data is on disk.
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn mission_notification_v1_history_lands_in_parent_thread_not_assistant_conv() {
+    use crate::channels::ChannelManager;
+    use crate::db::Database;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test_v1_parent_routing.db");
+    let backend = crate::db::libsql::LibSqlBackend::new_local(&db_path)
+        .await
+        .unwrap();
+    Database::run_migrations(&backend).await.unwrap();
+    let store: Arc<dyn Database> = Arc::new(backend);
+
+    let gw = test_gateway().with_store(store.clone());
+    let sse = Arc::clone(&gw.state.sse);
+
+    let mgr = ChannelManager::new();
+    mgr.add(Box::new(gw)).await;
+    let channels = Arc::new(mgr);
+
+    // Real chat threads always have a v1 conversations row before any mission
+    // can target them. Mirror that here — `add_conversation_message` has a FK
+    // on `conversations(id)` and would otherwise refuse the write.
+    let parent_uuid = store
+        .create_conversation("gateway", "test-user", None)
+        .await
+        .expect("parent v1 conversation should be creatable");
+    let parent = ironclaw_engine::ThreadId(parent_uuid);
+    let execution_thread = ironclaw_engine::ThreadId(uuid::Uuid::new_v4());
+
+    // Resolve the user's assistant conversation eagerly so we can assert the
+    // write did NOT land there.
+    let assistant_conv = store
+        .get_or_create_assistant_conversation("test-user", "gateway")
+        .await
+        .expect("assistant conv should be creatable");
+
+    let notif = ironclaw_engine::MissionNotification {
+        mission_id: ironclaw_engine::MissionId(uuid::Uuid::new_v4()),
+        mission_name: "v1-routing-test".to_string(),
+        thread_id: execution_thread,
+        parent_thread_id: Some(parent),
+        user_id: "test-user".to_string(),
+        notify_channels: vec!["gateway".to_string()],
+        notify_user: None,
+        response: Some("the mission result text".to_string()),
+        is_error: false,
+    };
+
+    crate::bridge::handle_mission_notification(&notif, &channels, Some(&sse), Some(&store), None)
+        .await;
+
+    let parent_messages = store
+        .list_conversation_messages_paginated(parent.0, None, 50)
+        .await
+        .expect("listing parent thread messages should succeed")
+        .0;
+    let parent_has_mission_output = parent_messages
+        .iter()
+        .any(|m| m.role == "assistant" && m.content.contains("the mission result text"));
+    assert!(
+        parent_has_mission_output,
+        "v1 chat history of parent thread must contain the mission output \
+         (mission output: {parent_messages:?})"
+    );
+
+    let assistant_messages = store
+        .list_conversation_messages_paginated(assistant_conv, None, 50)
+        .await
+        .expect("listing assistant conv messages should succeed")
+        .0;
+    let assistant_has_mission_output = assistant_messages
+        .iter()
+        .any(|m| m.role == "assistant" && m.content.contains("the mission result text"));
+    assert!(
+        !assistant_has_mission_output,
+        "v1 assistant conversation must NOT receive the mission output when a \
+         parent thread is set — that's the bug fix (assistant messages: {assistant_messages:?})"
+    );
+}
+
+/// Backward-compat regression: missions WITHOUT a parent (cron / learning /
+/// API-imported) still fall back to the user's assistant conversation so
+/// their output is visible somewhere. This locks in the parent-aware fix
+/// without breaking the legacy path.
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn mission_notification_v1_history_falls_back_to_assistant_when_no_parent() {
+    use crate::channels::ChannelManager;
+    use crate::db::Database;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test_v1_fallback.db");
+    let backend = crate::db::libsql::LibSqlBackend::new_local(&db_path)
+        .await
+        .unwrap();
+    Database::run_migrations(&backend).await.unwrap();
+    let store: Arc<dyn Database> = Arc::new(backend);
+
+    let gw = test_gateway().with_store(store.clone());
+    let sse = Arc::clone(&gw.state.sse);
+
+    let mgr = ChannelManager::new();
+    mgr.add(Box::new(gw)).await;
+    let channels = Arc::new(mgr);
+
+    let assistant_conv = store
+        .get_or_create_assistant_conversation("test-user", "gateway")
+        .await
+        .expect("assistant conv should be creatable");
+
+    let notif = ironclaw_engine::MissionNotification {
+        mission_id: ironclaw_engine::MissionId(uuid::Uuid::new_v4()),
+        mission_name: "cron-mission".to_string(),
+        thread_id: ironclaw_engine::ThreadId(uuid::Uuid::new_v4()),
+        parent_thread_id: None,
+        user_id: "test-user".to_string(),
+        notify_channels: vec!["gateway".to_string()],
+        notify_user: None,
+        response: Some("cron output".to_string()),
+        is_error: false,
+    };
+
+    crate::bridge::handle_mission_notification(&notif, &channels, Some(&sse), Some(&store), None)
+        .await;
+
+    let assistant_messages = store
+        .list_conversation_messages_paginated(assistant_conv, None, 50)
+        .await
+        .expect("listing assistant conv messages should succeed")
+        .0;
+    let assistant_has_cron = assistant_messages
+        .iter()
+        .any(|m| m.role == "assistant" && m.content.contains("cron output"));
+    assert!(
+        assistant_has_cron,
+        "missions with no parent_thread_id must still fall back to the assistant \
+         conversation so cron/learning output stays visible"
     );
 }
