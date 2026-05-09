@@ -24,6 +24,7 @@ const KNOWN_CHANNELS: &[(&str, &str)] = &[
     ("whatsapp", "whatsapp_channel"),
     ("feishu", "feishu_channel"),
     ("wecom", "wecom_channel"),
+    ("wechat", "wechat_channel"),
 ];
 
 /// Names of known channels that can be installed.
@@ -144,12 +145,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_known_channels_includes_all_four() {
+    fn test_known_channels_include_supported_bundles() {
         let names = bundled_channel_names();
         assert!(names.contains(&"telegram"));
         assert!(names.contains(&"slack"));
         assert!(names.contains(&"discord"));
         assert!(names.contains(&"whatsapp"));
+        assert!(names.contains(&"feishu"));
+        assert!(names.contains(&"wechat"));
     }
 
     #[test]

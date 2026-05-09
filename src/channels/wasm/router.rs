@@ -223,6 +223,11 @@ impl WasmChannelRouter {
             .is_some_and(|methods| methods.iter().any(|m| m == method.as_str()))
     }
 
+    /// Get a registered channel directly by name.
+    pub async fn get_channel_by_name(&self, channel_name: &str) -> Option<Arc<WasmChannel>> {
+        self.channels.read().await.get(channel_name).cloned()
+    }
+
     /// Validate a secret for a channel.
     pub async fn validate_secret(&self, channel_name: &str, provided: &str) -> bool {
         let secrets = self.secrets.read().await;
@@ -794,6 +799,10 @@ mod tests {
         // Should not find non-existent path
         let not_found = router.get_channel_for_path("/webhook/telegram").await;
         assert!(not_found.is_none());
+
+        let found_by_name = router.get_channel_by_name("slack").await;
+        assert!(found_by_name.is_some());
+        assert_eq!(found_by_name.unwrap().channel_name(), "slack");
     }
 
     #[tokio::test]

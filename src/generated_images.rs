@@ -58,11 +58,6 @@ impl GeneratedImageSentinel {
 
     pub(crate) fn summary_for_context(&self) -> String {
         let media_type = self.media_type().unwrap_or("image");
-        if let Some(path) = self.path()
-            && !path.is_empty()
-        {
-            return format!("Generated image ({media_type}) at {path}");
-        }
         format!("Generated image ({media_type})")
     }
 
@@ -281,7 +276,7 @@ mod tests {
 
         assert_eq!(
             sentinel.summary_for_context(),
-            "Generated image (image/png) at workspace/out.png"
+            "Generated image (image/png)"
         );
     }
 

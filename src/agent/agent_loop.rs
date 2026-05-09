@@ -7,8 +7,10 @@
 //! - `commands` - System commands and job handlers
 //! - `thread_ops` - Thread/session operations (user input, undo, approval, persistence)
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
+use base64::Engine as _;
 use futures::StreamExt;
 use uuid::Uuid;
 
@@ -20,16 +22,19 @@ use crate::agent::session::ThreadState;
 use crate::agent::session_manager::SessionManager;
 use crate::agent::submission::{Submission, SubmissionParser, SubmissionResult};
 use crate::agent::{HeartbeatConfig as AgentHeartbeatConfig, Router, Scheduler, SchedulerDeps};
-use crate::channels::{ChannelManager, IncomingMessage, OutgoingResponse, StatusUpdate};
+use crate::channels::{
+    ChannelManager, IncomingMessage, OutgoingAttachment, OutgoingResponse, StatusUpdate,
+};
 use crate::config::{AgentConfig, HeartbeatConfig, RoutineConfig, SkillsConfig};
 use crate::context::ContextManager;
 use crate::db::Database;
 use crate::error::{ChannelError, Error};
 use crate::extensions::ExtensionManager;
+use crate::generated_images::GeneratedImageSentinel;
 use crate::hooks::HookRegistry;
-use crate::llm::LlmProvider;
 use crate::tools::ToolRegistry;
 use crate::workspace::Workspace;
+use ironclaw_llm::LlmProvider;
 use ironclaw_safety::SafetyLayer;
 use ironclaw_skills::SkillRegistry;
 
@@ -47,12 +52,7 @@ pub(crate) enum HandleOutcome {
     /// Shutdown signal (e.g. `/quit`). Run loop should break.
     Shutdown,
     /// Send this content via the channel, then emit terminal `Done`.
-    Respond(String),
-    /// Send this content plus file attachments, then emit terminal `Done`.
-    RespondWithAttachments {
-        content: String,
-        attachments: Vec<String>,
-    },
+    Respond(OutgoingResponse),
     /// No response to send, but the turn is complete — emit `Done` only.
     NoResponse,
     /// Turn is paused (awaiting approval/auth/etc). Do not emit `Done`.
@@ -69,7 +69,7 @@ impl HandleOutcome {
             None => HandleOutcome::Shutdown,
             Some(s) if s == BRIDGE_PENDING_SENTINEL => HandleOutcome::Pending,
             Some(s) if s.is_empty() => HandleOutcome::NoResponse,
-            Some(s) => HandleOutcome::Respond(s),
+            Some(s) => HandleOutcome::Respond(OutgoingResponse::text(s)),
         }
     }
 }
@@ -77,7 +77,9 @@ impl HandleOutcome {
 impl From<crate::bridge::BridgeOutcome> for HandleOutcome {
     fn from(outcome: crate::bridge::BridgeOutcome) -> Self {
         match outcome {
-            crate::bridge::BridgeOutcome::Respond(s) => HandleOutcome::Respond(s),
+            crate::bridge::BridgeOutcome::Respond(s) => {
+                HandleOutcome::Respond(OutgoingResponse::text(s))
+            }
             crate::bridge::BridgeOutcome::NoResponse => HandleOutcome::NoResponse,
             crate::bridge::BridgeOutcome::Pending => HandleOutcome::Pending,
         }
@@ -151,6 +153,115 @@ fn is_single_message_repl(message: &IncomingMessage) -> bool {
             .get("single_message_mode")
             .and_then(|value| value.as_bool())
             .unwrap_or(false)
+}
+
+fn extension_for_image_media_type(media_type: &str) -> &'static str {
+    match media_type {
+        "image/jpeg" => "jpg",
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        _ => "bin",
+    }
+}
+
+fn generated_image_attachment_from_data_url(
+    data_url: &str,
+    fallback_media_type: Option<&str>,
+    index: usize,
+) -> Option<OutgoingAttachment> {
+    let (metadata, encoded) = data_url.split_once(',')?;
+    let header = metadata.strip_prefix("data:")?;
+    if !header
+        .split(';')
+        .any(|part| part.eq_ignore_ascii_case("base64"))
+    {
+        return None;
+    }
+
+    let media_type = header
+        .split(';')
+        .next()
+        .filter(|value| value.starts_with("image/"))
+        .or(fallback_media_type)
+        .unwrap_or("image/png");
+    if !media_type.starts_with("image/") {
+        return None;
+    }
+
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .ok()?;
+    if data.is_empty() {
+        return None;
+    }
+
+    Some(OutgoingAttachment {
+        filename: format!(
+            "generated-image-{}.{}",
+            index + 1,
+            extension_for_image_media_type(media_type)
+        ),
+        mime_type: media_type.to_string(),
+        data,
+    })
+}
+
+fn generated_image_attachments_for_turn(
+    turn: &crate::agent::session::Turn,
+) -> Vec<OutgoingAttachment> {
+    let mut seen = HashSet::new();
+    let mut attachments = Vec::new();
+
+    for (index, tool_call) in turn.tool_calls.iter().enumerate() {
+        let Some(result) = tool_call.result.as_ref() else {
+            continue;
+        };
+        let Some(sentinel) = GeneratedImageSentinel::from_value(result) else {
+            continue;
+        };
+        let Some(data_url) = sentinel
+            .data_url()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+
+        if !seen.insert(data_url.to_string()) {
+            continue;
+        }
+
+        match generated_image_attachment_from_data_url(data_url, sentinel.media_type(), index) {
+            Some(attachment) => attachments.push(attachment),
+            None => tracing::warn!("Generated image data URL could not be decoded for attachment"),
+        }
+    }
+
+    attachments
+}
+
+async fn build_outgoing_response_for_thread(
+    session: &Arc<tokio::sync::Mutex<crate::agent::session::Session>>,
+    thread_id: Uuid,
+    content: impl Into<String>,
+    attachment_paths: Vec<String>,
+) -> OutgoingResponse {
+    let mut response = OutgoingResponse::text(content).with_attachments(attachment_paths);
+    let attachments = {
+        let sess = session.lock().await;
+        sess.threads
+            .get(&thread_id)
+            .and_then(|thread| thread.last_turn())
+            .map(generated_image_attachments_for_turn)
+            .unwrap_or_default()
+    };
+
+    if response.attachments.is_empty() && !attachments.is_empty() {
+        response = response.with_inline_attachments(attachments);
+    }
+
+    response
 }
 
 async fn resolve_channel_notification_user(
@@ -233,9 +344,9 @@ pub struct AgentDeps {
     /// SSE manager for live job event streaming to the web gateway.
     pub sse_tx: Option<Arc<crate::channels::web::sse::SseManager>>,
     /// HTTP interceptor for trace recording/replay.
-    pub http_interceptor: Option<Arc<dyn crate::llm::recording::HttpInterceptor>>,
+    pub http_interceptor: Option<Arc<dyn ironclaw_llm::recording::HttpInterceptor>>,
     /// Audio transcription middleware for voice messages.
-    pub transcription: Option<Arc<crate::llm::transcription::TranscriptionMiddleware>>,
+    pub transcription: Option<Arc<ironclaw_llm::transcription::TranscriptionMiddleware>>,
     /// Document text extraction middleware for PDF, DOCX, PPTX, etc.
     pub document_extraction: Option<Arc<crate::document_extraction::DocumentExtractionMiddleware>>,
     /// Sandbox readiness state for full-job routine dispatch.
@@ -1172,7 +1283,9 @@ impl Agent {
             // Apply transcription middleware to audio attachments
             let mut message = message;
             if let Some(ref transcription) = self.deps.transcription {
-                transcription.process(&mut message).await;
+                transcription
+                    .process(&mut message.attachments, &mut message.content)
+                    .await;
             }
 
             // Apply document extraction middleware to document attachments
@@ -1185,15 +1298,46 @@ impl Agent {
 
             match self.handle_message(&message).await {
                 Ok(HandleOutcome::Respond(response)) => {
-                    self.send_handle_response(&message, response, Vec::new())
-                        .await;
-                }
-                Ok(HandleOutcome::RespondWithAttachments {
-                    content,
-                    attachments,
-                }) => {
-                    self.send_handle_response(&message, content, attachments)
-                        .await;
+                    // Hook: BeforeOutbound — allow hooks to modify or suppress outbound
+                    let event = crate::hooks::HookEvent::Outbound {
+                        user_id: message.user_id.clone(),
+                        channel: message.channel.clone(),
+                        content: response.content.clone(),
+                        thread_id: message.thread_id.as_ref().map(|t| t.as_str().to_string()),
+                    };
+                    match self.hooks().run(&event).await {
+                        Err(err) => {
+                            tracing::warn!("BeforeOutbound hook blocked response: {}", err);
+                            crate::generated_images::remove_staged_generated_image_attachments(
+                                &response.attachments,
+                            );
+                            // Still send Done so the client knows the turn is complete
+                            // even though the response was suppressed by the hook.
+                            self.send_done(&message).await;
+                        }
+                        Ok(crate::hooks::HookOutcome::Continue {
+                            modified: Some(new_content),
+                        }) => {
+                            let mut response = response;
+                            response.content = new_content;
+                            if let Err(e) = self.respond_then_done(&message, response).await {
+                                tracing::error!(
+                                    channel = %message.channel,
+                                    error = %e,
+                                    "Failed to send response to channel"
+                                );
+                            }
+                        }
+                        _ => {
+                            if let Err(e) = self.respond_then_done(&message, response).await {
+                                tracing::error!(
+                                    channel = %message.channel,
+                                    error = %e,
+                                    "Failed to send response to channel"
+                                );
+                            }
+                        }
+                    }
                 }
                 Ok(HandleOutcome::NoResponse) => {
                     tracing::debug!(
@@ -1275,55 +1419,6 @@ impl Agent {
         self.channels.shutdown_all().await?;
 
         Ok(())
-    }
-
-    async fn send_handle_response(
-        &self,
-        message: &IncomingMessage,
-        response: String,
-        attachments: Vec<String>,
-    ) {
-        let original_attachments = attachments.clone();
-        let mut response_payload = OutgoingResponse::text(response.clone());
-        response_payload.attachments = attachments;
-
-        // Hook: BeforeOutbound — allow hooks to modify or suppress outbound
-        let event = crate::hooks::HookEvent::Outbound {
-            user_id: message.user_id.clone(),
-            channel: message.channel.clone(),
-            content: response,
-            thread_id: message.thread_id.as_ref().map(|t| t.as_str().to_string()),
-        };
-        match self.hooks().run(&event).await {
-            Err(err) => {
-                tracing::warn!("BeforeOutbound hook blocked response: {}", err);
-                crate::generated_images::remove_staged_generated_image_attachments(
-                    &original_attachments,
-                );
-                self.send_done(message).await;
-            }
-            Ok(crate::hooks::HookOutcome::Continue {
-                modified: Some(new_content),
-            }) => {
-                response_payload.content = new_content;
-                if let Err(e) = self.respond_then_done(message, response_payload).await {
-                    tracing::error!(
-                        channel = %message.channel,
-                        error = %e,
-                        "Failed to send response to channel"
-                    );
-                }
-            }
-            _ => {
-                if let Err(e) = self.respond_then_done(message, response_payload).await {
-                    tracing::error!(
-                        channel = %message.channel,
-                        error = %e,
-                        "Failed to send response to channel"
-                    );
-                }
-            }
-        }
     }
 
     /// Store extracted document text in workspace memory for future search/recall.
@@ -1414,7 +1509,9 @@ impl Agent {
                 channel = %message.channel,
                 "Forwarding internal message"
             );
-            return Ok(HandleOutcome::Respond(message.content.clone()));
+            return Ok(HandleOutcome::Respond(OutgoingResponse::text(
+                message.content.clone(),
+            )));
         }
 
         // Set message tool context for this turn (current channel and target)
@@ -1470,16 +1567,16 @@ impl Agent {
             };
             match self.hooks().run(&event).await {
                 Err(crate::hooks::HookError::Rejected { reason }) => {
-                    return Ok(HandleOutcome::Respond(format!(
+                    return Ok(HandleOutcome::Respond(OutgoingResponse::text(format!(
                         "[Message rejected: {}]",
                         reason
-                    )));
+                    ))));
                 }
                 Err(err) => {
-                    return Ok(HandleOutcome::Respond(format!(
+                    return Ok(HandleOutcome::Respond(OutgoingResponse::text(format!(
                         "[Message blocked by hook policy: {}]",
                         err
-                    )));
+                    ))));
                 }
                 Ok(crate::hooks::HookOutcome::Continue {
                     modified: Some(new_content),
@@ -1585,14 +1682,14 @@ impl Agent {
         if !self.config.engine_v2 {
             match submission {
                 Submission::ExternalCallback { .. } => {
-                    return Ok(HandleOutcome::Respond(
+                    return Ok(HandleOutcome::Respond(OutgoingResponse::text(
                         "Error: External callbacks require ENGINE_V2".to_string(),
-                    ));
+                    )));
                 }
                 Submission::GateAuthResolution { .. } => {
-                    return Ok(HandleOutcome::Respond(
+                    return Ok(HandleOutcome::Respond(OutgoingResponse::text(
                         "Error: Auth gate resolution requires ENGINE_V2".to_string(),
-                    ));
+                    )));
                 }
                 _ => {}
             }
@@ -1606,7 +1703,10 @@ impl Agent {
                 "Hydrating thread from DB"
             );
             if let Some(rejection) = self.maybe_hydrate_thread(message, external_thread_id).await {
-                return Ok(HandleOutcome::Respond(format!("Error: {}", rejection)));
+                return Ok(HandleOutcome::Respond(OutgoingResponse::text(format!(
+                    "Error: {}",
+                    rejection
+                ))));
             }
         }
 
@@ -1648,9 +1748,9 @@ impl Agent {
                         "Blocked approval for thread with no pending approval"
                     );
                     drop(sess);
-                    return Ok(HandleOutcome::Respond(
-                        "Error: no pending approval on this thread".into(),
-                    ));
+                    return Ok(HandleOutcome::Respond(OutgoingResponse::text(
+                        "Error: no pending approval on this thread",
+                    )));
                 }
                 // ApprovalResponse (bare "yes"/"no"/"always") without a
                 // pending approval: fall through to normal handling so the
@@ -1671,9 +1771,9 @@ impl Agent {
                             "Blocked cross-channel approval attempt"
                         );
                         drop(sess);
-                        return Ok(HandleOutcome::Respond(
-                            "Error: approval not authorized for this channel".into(),
-                        ));
+                        return Ok(HandleOutcome::Respond(OutgoingResponse::text(
+                            "Error: approval not authorized for this channel",
+                        )));
                     }
                 }
                 sess.active_thread = Some(target_thread_id);
@@ -1740,10 +1840,10 @@ impl Agent {
                 // If this was a user message (possibly a pasted token), return an
                 // explicit error instead of forwarding it to the LLM/history.
                 if matches!(submission, Submission::UserInput { .. }) {
-                    return Ok(HandleOutcome::Respond(format!(
+                    return Ok(HandleOutcome::Respond(OutgoingResponse::text(format!(
                         "Authentication for **{}** expired. Please try again.",
                         pending.extension_name
-                    )));
+                    ))));
                 }
                 // Control submissions (interrupt, undo, etc.) fall through to normal handling
             } else {
@@ -1868,18 +1968,14 @@ impl Agent {
                     //   identity will attribute every response to the first
                     //   message. This is acceptable for the current
                     //   single-user-per-thread model.
-                    if let Err(e) = self
-                        .respond_then_done(
-                            message,
-                            OutgoingResponse {
-                                content: outgoing.clone(),
-                                thread_id: None,
-                                attachments: attachments.clone(),
-                                metadata: serde_json::Value::Null,
-                            },
-                        )
-                        .await
-                    {
+                    let response = build_outgoing_response_for_thread(
+                        &session,
+                        thread_id,
+                        outgoing.clone(),
+                        attachments.clone(),
+                    )
+                    .await;
+                    if let Err(e) = self.respond_then_done(message, response).await {
                         tracing::warn!(
                             thread_id = %thread_id,
                             "Failed to send intermediate drain-loop response: {e}"
@@ -1932,13 +2028,22 @@ impl Agent {
                         .handle_reasoning_command(&args, &session, thread_id)
                         .await;
                     return match result {
-                        SubmissionResult::Response { content, .. } => {
-                            Ok(HandleOutcome::Respond(content))
-                        }
+                        SubmissionResult::Response {
+                            content,
+                            attachments,
+                        } => Ok(HandleOutcome::Respond(
+                            build_outgoing_response_for_thread(
+                                &session,
+                                thread_id,
+                                content,
+                                attachments,
+                            )
+                            .await,
+                        )),
                         SubmissionResult::Ok { message } => Ok(HandleOutcome::from_legacy(message)),
-                        SubmissionResult::Error { message } => {
-                            Ok(HandleOutcome::Respond(format!("Error: {}", message)))
-                        }
+                        SubmissionResult::Error { message } => Ok(HandleOutcome::Respond(
+                            OutgoingResponse::text(format!("Error: {}", message)),
+                        )),
                         _ => {
                             if is_single_message_repl(message) {
                                 Ok(HandleOutcome::Shutdown)
@@ -1952,17 +2057,17 @@ impl Agent {
                 self.handle_system_command(&command, &args, &message.channel, &tenant)
                     .await
             }
-            Submission::Undo => self.process_undo(session, thread_id).await,
-            Submission::Redo => self.process_redo(session, thread_id).await,
-            Submission::Interrupt => self.process_interrupt(session, thread_id).await,
-            Submission::Compact => self.process_compact(session, thread_id).await,
-            Submission::Clear => self.process_clear(session, thread_id).await,
+            Submission::Undo => self.process_undo(session.clone(), thread_id).await,
+            Submission::Redo => self.process_redo(session.clone(), thread_id).await,
+            Submission::Interrupt => self.process_interrupt(session.clone(), thread_id).await,
+            Submission::Compact => self.process_compact(session.clone(), thread_id).await,
+            Submission::Clear => self.process_clear(session.clone(), thread_id).await,
             Submission::NewThread => self.process_new_thread(message).await,
             Submission::Heartbeat => self.process_heartbeat().await,
-            Submission::Summarize => self.process_summarize(session, thread_id).await,
-            Submission::Suggest => self.process_suggest(session, thread_id).await,
+            Submission::Summarize => self.process_summarize(session.clone(), thread_id).await,
+            Submission::Suggest => self.process_suggest(session.clone(), thread_id).await,
             Submission::Expected { description } => {
-                self.process_expected(session, thread_id, &description, &message.user_id)
+                self.process_expected(session.clone(), thread_id, &description, &message.user_id)
                     .await
             }
             Submission::JobStatus { job_id } => {
@@ -1974,9 +2079,10 @@ impl Agent {
                 self.process_switch_thread(message, target).await
             }
             Submission::Resume { checkpoint_id } => {
-                self.process_resume(session, thread_id, checkpoint_id).await
+                self.process_resume(session.clone(), thread_id, checkpoint_id)
+                    .await
             }
-            Submission::ListThreads => self.process_list_threads(session, message).await,
+            Submission::ListThreads => self.process_list_threads(session.clone(), message).await,
             Submission::ExecApproval {
                 request_id,
                 approved,
@@ -1984,7 +2090,7 @@ impl Agent {
             } => {
                 self.process_approval(
                     message,
-                    session,
+                    session.clone(),
                     thread_id,
                     Some(request_id),
                     approved,
@@ -2009,8 +2115,15 @@ impl Agent {
                 // NOTE: TOCTOU possible — state could change between check
                 // and process_approval; process_approval handles stale cases.
                 if should_route_as_approval(thread_state, &message.content) {
-                    self.process_approval(message, session, thread_id, None, approved, always)
-                        .await
+                    self.process_approval(
+                        message,
+                        session.clone(),
+                        thread_id,
+                        None,
+                        approved,
+                        always,
+                    )
+                    .await
                 } else {
                     // Run BeforeInbound hooks for the downgraded content —
                     // the hook check above only fires for UserInput submissions,
@@ -2025,15 +2138,15 @@ impl Agent {
                     let content = match self.hooks().run(&hook_event).await {
                         Err(crate::hooks::HookError::Rejected { reason }) => {
                             // Match the main UserInput path's rejection behavior.
-                            return Ok(HandleOutcome::Respond(format!(
+                            return Ok(HandleOutcome::Respond(OutgoingResponse::text(format!(
                                 "[Message rejected: {reason}]"
-                            )));
+                            ))));
                         }
                         Err(err) => {
                             // Match the main UserInput path's error behavior.
-                            return Ok(HandleOutcome::Respond(format!(
+                            return Ok(HandleOutcome::Respond(OutgoingResponse::text(format!(
                                 "[Message blocked by hook policy: {err}]"
-                            )));
+                            ))));
                         }
                         Ok(crate::hooks::HookOutcome::Continue {
                             modified: Some(new_content),
@@ -2069,18 +2182,14 @@ impl Agent {
                             break;
                         };
 
-                        if let Err(e) = self
-                            .respond_then_done(
-                                message,
-                                OutgoingResponse {
-                                    content: outgoing.clone(),
-                                    thread_id: None,
-                                    attachments: attachments.clone(),
-                                    metadata: serde_json::Value::Null,
-                                },
-                            )
-                            .await
-                        {
+                        let response = build_outgoing_response_for_thread(
+                            &session,
+                            thread_id,
+                            outgoing.clone(),
+                            attachments.clone(),
+                        )
+                        .await;
+                        if let Err(e) = self.respond_then_done(message, response).await {
                             tracing::warn!(
                                 %thread_id,
                                 "Failed to send intermediate drain-loop response: {e}"
@@ -2142,7 +2251,7 @@ impl Agent {
                             .to_string()
                     }
                 };
-                self.process_user_input(message, tenant, session, thread_id, &rewritten)
+                self.process_user_input(message, tenant, session.clone(), thread_id, &rewritten)
                     .await
             }
         };
@@ -2155,20 +2264,21 @@ impl Agent {
             } => {
                 // Suppress silent replies (e.g. from group chat "nothing to say" responses).
                 // Silent replies exit single-message REPL invocations.
-                if crate::llm::is_silent_reply(&content) {
+                if ironclaw_llm::is_silent_reply(&content) {
                     tracing::debug!("Suppressing silent reply token");
                     Ok(HandleOutcome::Shutdown)
                 } else if content.is_empty() {
                     Ok(HandleOutcome::NoResponse)
                 } else {
-                    if attachments.is_empty() {
-                        Ok(HandleOutcome::Respond(content))
-                    } else {
-                        Ok(HandleOutcome::RespondWithAttachments {
+                    Ok(HandleOutcome::Respond(
+                        build_outgoing_response_for_thread(
+                            &session,
+                            thread_id,
                             content,
                             attachments,
-                        })
-                    }
+                        )
+                        .await,
+                    ))
                 }
             }
             SubmissionResult::Ok {
@@ -2191,10 +2301,12 @@ impl Agent {
                     Ok(HandleOutcome::from_legacy(output_message))
                 }
             }
-            SubmissionResult::Error { message } => {
-                Ok(HandleOutcome::Respond(format!("Error: {}", message)))
-            }
-            SubmissionResult::Interrupted => Ok(HandleOutcome::Respond("Interrupted.".into())),
+            SubmissionResult::Error { message } => Ok(HandleOutcome::Respond(
+                OutgoingResponse::text(format!("Error: {}", message)),
+            )),
+            SubmissionResult::Interrupted => Ok(HandleOutcome::Respond(OutgoingResponse::text(
+                "Interrupted.",
+            ))),
             SubmissionResult::AuthPending => {
                 // Auth-required status already sent by handle_auth_intercept.
                 // Thread is in auth mode — suppress text response and Done.
@@ -2222,15 +2334,13 @@ mod tests {
     use crate::agent::cost_guard::{CostGuard, CostGuardConfig};
     use crate::agent::submission::{AuthGateResolution, Submission};
     use crate::channels::IncomingMessage;
+    use crate::config::{AgentConfig, SafetyConfig, SkillsConfig};
     use crate::error::ChannelError;
     use crate::hooks::HookRegistry;
     use crate::tools::ToolRegistry;
-    use crate::{
-        config::{AgentConfig, SafetyConfig, SkillsConfig},
-        llm::{
-            CompletionRequest, CompletionResponse, FinishReason, LlmProvider,
-            ToolCompletionRequest, ToolCompletionResponse,
-        },
+    use ironclaw_llm::{
+        CompletionRequest, CompletionResponse, FinishReason, LlmProvider, ToolCompletionRequest,
+        ToolCompletionResponse,
     };
     use ironclaw_safety::SafetyLayer;
     use rust_decimal::Decimal;
@@ -2276,6 +2386,7 @@ mod tests {
                 finish_reason: FinishReason::Stop,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                reasoning: None,
             })
         }
     }
@@ -2639,6 +2750,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn build_outgoing_response_for_thread_includes_generated_image_inline_attachments() {
+        use super::build_outgoing_response_for_thread;
+        use crate::agent::session::Session;
+        use std::sync::Arc;
+
+        let session: Arc<tokio::sync::Mutex<Session>> =
+            Arc::new(tokio::sync::Mutex::new(Session::new("user-123")));
+
+        let thread_id = {
+            let mut sess = session.lock().await;
+            let thread = sess.create_thread(None);
+            let thread_id = thread.id;
+            let turn = thread.start_turn("draw a cat");
+            turn.record_tool_call("image_generate", serde_json::json!({ "prompt": "cat" }));
+            turn.record_tool_result(serde_json::json!({
+                "type": "image_generated",
+                "data": "data:image/png;base64,cG5nLWJ5dGVz",
+                "media_type": "image/png",
+            }));
+            thread_id
+        };
+
+        let response =
+            build_outgoing_response_for_thread(&session, thread_id, "done", Vec::new()).await;
+
+        assert_eq!(response.content, "done");
+        assert!(response.attachments.is_empty());
+        assert_eq!(response.inline_attachments.len(), 1);
+        assert_eq!(
+            response.inline_attachments[0].filename,
+            "generated-image-1.png"
+        );
+        assert_eq!(response.inline_attachments[0].mime_type, "image/png");
+        assert_eq!(response.inline_attachments[0].data, b"png-bytes");
+    }
+
+    #[tokio::test]
     async fn v2_only_structured_submissions_do_not_switch_threads_when_engine_v2_disabled() {
         let agent = make_legacy_handle_message_test_agent();
         let session = agent.session_manager.get_or_create_session("alice").await;
@@ -2675,7 +2823,7 @@ mod tests {
             .expect("handle message");
         assert!(matches!(
             outcome,
-            HandleOutcome::Respond(ref msg) if msg == "Error: Auth gate resolution requires ENGINE_V2"
+            HandleOutcome::Respond(ref msg) if msg.content == "Error: Auth gate resolution requires ENGINE_V2"
         ));
         {
             let sess = session.lock().await;
@@ -2695,7 +2843,7 @@ mod tests {
             .expect("handle callback");
         assert!(matches!(
             outcome,
-            HandleOutcome::Respond(ref msg) if msg == "Error: External callbacks require ENGINE_V2"
+            HandleOutcome::Respond(ref msg) if msg.content == "Error: External callbacks require ENGINE_V2"
         ));
         {
             let sess = session.lock().await;
