@@ -7,6 +7,12 @@ const ADAPTER_LABELS = {
   ollama: 'Ollama',
   bedrock: 'AWS Bedrock',
   nearai: 'NEAR AI',
+  openai_codex: 'OpenAI Codex',
+  gemini_oauth: 'Gemini CLI OAuth',
+  github_copilot: 'GitHub Copilot',
+  deep_seek: 'DeepSeek',
+  gemini: 'Google Gemini',
+  open_router: 'OpenRouter',
 };
 
 let _builtinProviders = [];

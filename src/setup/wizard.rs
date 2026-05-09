@@ -1283,60 +1283,27 @@ impl SetupWizard {
 
     /// Step 3: Inference provider selection.
     ///
-    /// Uses the provider registry to dynamically build the selection menu.
-    /// NearAI is always first (special auth), then all registry providers
-    /// that have setup hints.
+    /// The menu is built entirely from the LLM crate's
+    /// [`ironclaw_llm::ProviderRegistry::selectable`] — every supported
+    /// backend including the dedicated-config ones (nearai, bedrock,
+    /// openai_codex, gemini_oauth) declares its `SetupHint` in
+    /// `providers.json`, and dispatch goes through that hint. No
+    /// per-backend `if id == "..."` branches live here.
     async fn step_inference_provider(&mut self) -> Result<(), SetupError> {
         let registry = ironclaw_llm::ProviderRegistry::load();
 
-        // Show current provider if already configured
+        // Show current provider if already configured.
         if let Some(current) = self.settings.llm_backend.clone() {
-            let display = if current == "nearai" {
-                "NEAR AI".to_string()
-            } else if let Some(def) = registry.find(&current) {
-                def.setup
-                    .as_ref()
-                    .map(|s| s.display_name().to_string())
-                    .unwrap_or_else(|| def.id.clone())
-            } else {
-                match current.as_str() {
-                    "nearai" => "NEAR AI".to_string(),
-                    "gemini_oauth" | "gemini-oauth" => "Gemini API (OAuth)".to_string(),
-                    _ => {
-                        if let Some(def) = registry.find(&current) {
-                            def.setup
-                                .as_ref()
-                                .map(|s| s.display_name().to_string())
-                                .unwrap_or_else(|| def.id.clone())
-                        } else {
-                            current.clone()
-                        }
-                    }
-                }
-            };
+            let display = registry
+                .find(&current)
+                .and_then(|def| def.setup.as_ref().map(|s| s.display_name().to_string()))
+                .unwrap_or_else(|| current.clone());
             print_info(&format!("Current provider: {}", display));
             println!();
 
-            let is_known = current == "nearai"
-                || current == "bedrock"
-                || current == "gemini_oauth"
-                || current == "gemini-oauth"
-                || current == "openai_codex"
-                || registry.is_known(&current);
+            let is_known = registry.is_known(&current);
 
             if is_known && confirm("Keep current provider?", true).map_err(SetupError::Io)? {
-                if current == "bedrock" {
-                    print_info("Keeping existing AWS Bedrock configuration.");
-                    return Ok(());
-                }
-                if current == "gemini_oauth" || current == "gemini-oauth" {
-                    print_info("Keeping existing Gemini CLI OAuth configuration.");
-                    return Ok(());
-                }
-                if current == "openai_codex" {
-                    print_info("Keeping existing OpenAI Codex configuration.");
-                    return Ok(());
-                }
                 return self.run_provider_setup(&current, &registry).await;
             }
 
@@ -1351,171 +1318,115 @@ impl SetupWizard {
         print_info("Select your inference provider:");
         println!();
 
-        // Build menu: NearAI first, then Gemini OAuth, then OpenAI Codex, then registry providers, then Bedrock
         let selectable = registry.selectable();
 
-        // Detect which providers have API keys already set in the environment.
-        let detected_env: HashMap<&str, bool> = [
-            ("nearai", std::env::var("NEARAI_API_KEY").is_ok()),
-            (
-                "anthropic",
-                std::env::var("ANTHROPIC_API_KEY").is_ok()
-                    || std::env::var("ANTHROPIC_OAUTH_TOKEN").is_ok(),
-            ),
-            ("openai", std::env::var("OPENAI_API_KEY").is_ok()),
-            ("openrouter", std::env::var("OPENROUTER_API_KEY").is_ok()),
-        ]
-        .into_iter()
-        .collect();
-
-        // Helper: build a label for a provider entry, prepending a checkmark if detected.
-        let make_label = |id: &str, name: &str, desc: &str| -> String {
-            if detected_env.get(id).copied().unwrap_or(false) {
-                format!("\u{2713} {:<15}- {}", name, desc)
-            } else {
-                format!("  {:<15}- {}", name, desc)
-            }
+        // A provider is "detected" if its declared API key env var is
+        // populated, OR if it's Anthropic and the OAuth-token env var is
+        // set instead. Other backends (bedrock = AWS chain, codex = OAuth,
+        // nearai = session) have no env-detectable presence.
+        let is_detected = |def: &ironclaw_llm::ProviderDefinition| -> bool {
+            let primary = def
+                .api_key_env
+                .as_deref()
+                .is_some_and(|env| std::env::var(env).is_ok());
+            let anthropic_oauth =
+                def.id == "anthropic" && std::env::var("ANTHROPIC_OAUTH_TOKEN").is_ok();
+            primary || anthropic_oauth
         };
 
-        // Collect all entries as (provider_id, label, is_detected).
         struct ProviderEntry {
             id: String,
             label: String,
             detected: bool,
         }
 
-        let mut entries: Vec<ProviderEntry> = Vec::with_capacity(2 + selectable.len());
+        let mut entries: Vec<ProviderEntry> = selectable
+            .iter()
+            .map(|def| {
+                let display_name = def
+                    .setup
+                    .as_ref()
+                    .map(|s| s.display_name())
+                    .unwrap_or(&def.id);
+                let detected = is_detected(def);
+                let prefix = if detected { '\u{2713}' } else { ' ' };
+                ProviderEntry {
+                    id: def.id.clone(),
+                    label: format!("{prefix} {:<15}- {}", display_name, def.description),
+                    detected,
+                }
+            })
+            .collect();
 
-        entries.push(ProviderEntry {
-            id: "nearai".to_string(),
-            label: make_label("nearai", "NEAR AI", "multi-model access via NEAR account"),
-            detected: detected_env.get("nearai").copied().unwrap_or(false),
-        });
-
-        entries.push(ProviderEntry {
-            id: "gemini_oauth".to_string(),
-            label: make_label(
-                "gemini_oauth",
-                "Gemini CLI",
-                "Official Gemini API via Gemini CLI OAuth",
-            ),
-            detected: false,
-        });
-
-        entries.push(ProviderEntry {
-            id: "openai_codex".to_string(),
-            label: make_label(
-                "openai_codex",
-                "OpenAI Codex",
-                "ChatGPT subscription (Plus/Pro/Max)",
-            ),
-            detected: false,
-        });
-
-        for def in &selectable {
-            let display_name = def
-                .setup
-                .as_ref()
-                .map(|s| s.display_name())
-                .unwrap_or(&def.id);
-            entries.push(ProviderEntry {
-                id: def.id.clone(),
-                label: make_label(&def.id, display_name, &def.description),
-                detected: detected_env.get(def.id.as_str()).copied().unwrap_or(false),
-            });
-        }
-
-        // Bedrock is a special case (native AWS SDK, not registry-based)
-        entries.push(ProviderEntry {
-            id: "bedrock".to_string(),
-            label: make_label(
-                "bedrock",
-                "AWS Bedrock",
-                "Claude & other models via AWS (IAM, SSO)",
-            ),
-            detected: false,
-        });
-
-        // Sort: detected providers first, preserving relative order within each group.
+        // Detected providers first; relative order within each group is
+        // preserved, so providers.json controls the menu ordering for
+        // the no-detection case.
         entries.sort_by_key(|e| !e.detected);
 
-        let mut options: Vec<String> = Vec::with_capacity(entries.len());
-        let mut provider_ids: Vec<String> = Vec::with_capacity(entries.len());
-        for entry in &entries {
-            options.push(entry.label.clone());
-            provider_ids.push(entry.id.clone());
-        }
-
+        let options: Vec<String> = entries.iter().map(|e| e.label.clone()).collect();
         let option_refs: Vec<&str> = options.iter().map(|s| s.as_str()).collect();
         let choice = select_one("Provider:", &option_refs).map_err(SetupError::Io)?;
-        let selected_id = &provider_ids[choice];
+        let selected_id = entries[choice].id.clone();
 
-        if selected_id == "bedrock" {
-            self.setup_bedrock().await?;
-        } else if selected_id == "gemini_oauth" {
-            self.setup_gemini_oauth().await?;
-        } else {
-            self.run_provider_setup(selected_id, &registry).await?;
-        }
+        self.run_provider_setup(&selected_id, &registry).await?;
 
         Ok(())
     }
 
-    /// Run the setup flow for a specific provider.
+    /// Run the setup flow for a specific provider, dispatching purely
+    /// off the registry's [`ironclaw_llm::registry::SetupHint`].
     ///
-    /// NearAI has its own special flow. Registry providers dispatch
-    /// based on their `SetupHint` kind.
+    /// The wizard does not know about per-backend strings — every supported
+    /// backend declares its credential collection style in `providers.json`,
+    /// and that style maps to one of the seven `setup_*` helpers below.
+    /// The two remaining `def.id == "..."` checks live inside the `ApiKey`
+    /// arm because Anthropic and GitHub Copilot present a hybrid choice
+    /// (API key OR OAuth) that the simple ApiKey hint does not capture.
     async fn run_provider_setup(
         &mut self,
         provider_id: &str,
         registry: &ironclaw_llm::ProviderRegistry,
     ) -> Result<(), SetupError> {
-        if provider_id == "nearai" {
-            return self.setup_nearai().await;
-        }
-
-        if provider_id == "openai_codex" {
-            return self.setup_openai_codex().await;
-        }
-
         let def = registry
             .find(provider_id)
             .ok_or_else(|| SetupError::Config(format!("Unknown provider: {}", provider_id)))?;
 
-        // Providers without a setup hint (e.g., user-defined providers configured
-        // purely via env vars) skip credential setup and go to model selection.
+        // Providers without a setup hint (e.g., user-defined providers
+        // configured purely via env vars) skip credential setup and go
+        // straight to model selection.
         let Some(setup) = def.setup.as_ref() else {
             print_info(&format!(
                 "Provider '{}' has no setup wizard. Configure via environment variables.",
                 provider_id
             ));
-            self.set_llm_backend_preserving_model(provider_id);
+            self.set_llm_backend_preserving_model(&def.id);
             return Ok(());
         };
 
-        // Anthropic has a custom flow: API key or OAuth token from `claude login`.
-        if provider_id == "anthropic" {
-            return self.setup_anthropic().await;
-        }
-
-        if provider_id == "github_copilot" {
-            return self.setup_github_copilot().await;
-        }
-
+        use ironclaw_llm::registry::SetupHint;
         match setup {
-            ironclaw_llm::registry::SetupHint::ApiKey {
+            SetupHint::ApiKey {
                 secret_name,
                 key_url,
                 display_name,
                 ..
             } => {
+                // Hybrid flows: Anthropic adds an "API key or `claude
+                // login` OAuth" choice; GitHub Copilot adds a paste-vs-
+                // device-code choice. Both still classify as ApiKey.
+                if def.id == "anthropic" {
+                    return self.setup_anthropic().await;
+                }
+                if def.id == "github_copilot" {
+                    return self.setup_github_copilot().await;
+                }
+
                 let env_var = def.api_key_env.as_deref().unwrap_or("LLM_API_KEY");
                 let url = key_url.as_deref().unwrap_or("the provider's website");
 
                 // Only store base URL for providers that resolve through
-                // LLM_BASE_URL (openai_compatible, openrouter). Other providers
-                // like groq/nvidia have their own base_url_env and don't need
-                // this backward-compat setting.
+                // LLM_BASE_URL (openai_compatible, openrouter). Other
+                // providers (groq/nvidia/etc.) have their own base_url_env.
                 if def.base_url_env.as_deref() == Some("LLM_BASE_URL")
                     && let Some(ref base_url) = def.default_base_url
                 {
@@ -1532,16 +1443,33 @@ impl SetupWizard {
                 )
                 .await?;
             }
-            ironclaw_llm::registry::SetupHint::Ollama { .. } => {
+            SetupHint::Ollama { .. } => {
                 self.setup_ollama_generic(def)?;
             }
-            ironclaw_llm::registry::SetupHint::OpenAiCompatible {
+            SetupHint::OpenAiCompatible {
                 secret_name,
                 display_name,
                 ..
             } => {
                 self.setup_openai_compatible_generic(&def.id, secret_name, display_name)
                     .await?;
+            }
+            SetupHint::AwsCredentials { .. } => {
+                self.setup_bedrock().await?;
+            }
+            SetupHint::OAuthDeviceCode { backend, .. } => match backend.as_str() {
+                "openai_codex" => self.setup_openai_codex().await?,
+                other => {
+                    return Err(SetupError::Config(format!(
+                        "OAuth device-code flow for backend '{other}' is not implemented"
+                    )));
+                }
+            },
+            SetupHint::FileBasedCredentials { .. } => {
+                self.setup_gemini_oauth().await?;
+            }
+            SetupHint::SessionToken { .. } => {
+                self.setup_nearai().await?;
             }
         }
 
@@ -1953,22 +1881,34 @@ impl SetupWizard {
     }
 
     /// AWS Bedrock provider setup: region, auth, and cross-region config.
+    ///
+    /// Writes through the generic `llm_builtin_overrides["bedrock"].extras`
+    /// bag introduced in Layer D — no top-level `bedrock_*` `Settings`
+    /// fields are touched.
     async fn setup_bedrock(&mut self) -> Result<(), SetupError> {
         self.set_llm_backend_preserving_model("bedrock");
 
         // Region
-        let default_region = self
+        let bedrock = self
             .settings
-            .bedrock_region
-            .as_deref()
-            .unwrap_or("us-east-1");
+            .llm_builtin_overrides
+            .entry("bedrock".to_string())
+            .or_default();
+        let default_region = bedrock
+            .extra("region")
+            .unwrap_or(ironclaw_llm::BedrockConfig::DEFAULT_REGION)
+            .to_string();
 
         let region_input =
             optional_input("AWS region", Some(&format!("default: {}", default_region)))
                 .map_err(SetupError::Io)?;
 
-        let region = region_input.unwrap_or_else(|| default_region.to_string());
-        self.settings.bedrock_region = Some(region.clone());
+        let region = region_input.unwrap_or(default_region);
+        self.settings
+            .llm_builtin_overrides
+            .entry("bedrock".to_string())
+            .or_default()
+            .set_extra("region", region.clone());
 
         // Auth method
         print_info("Select authentication method:");
@@ -1979,10 +1919,15 @@ impl SetupWizard {
         ];
         let auth_choice = select_one("Auth:", auth_options).map_err(SetupError::Io)?;
 
+        let bedrock = self
+            .settings
+            .llm_builtin_overrides
+            .entry("bedrock".to_string())
+            .or_default();
         match auth_choice {
             0 => {
                 // Default AWS credentials — clear any stale named profile
-                self.settings.bedrock_profile = None;
+                bedrock.set_extra("profile", "");
                 print_info(
                     "Using default AWS credential chain (env vars, ~/.aws/credentials, IAM roles).",
                 );
@@ -1992,11 +1937,10 @@ impl SetupWizard {
                 let profile =
                     input("AWS profile name (from ~/.aws/config)").map_err(SetupError::Io)?;
                 if profile.trim().is_empty() {
-                    // Empty input clears any previously configured profile
-                    self.settings.bedrock_profile = None;
+                    bedrock.set_extra("profile", "");
                     print_info("AWS profile cleared; using default AWS credential chain instead.");
                 } else {
-                    self.settings.bedrock_profile = Some(profile.clone());
+                    bedrock.set_extra("profile", profile.clone());
                     print_success(&format!("AWS profile '{}' saved", profile));
                 }
             }
@@ -2019,21 +1963,22 @@ impl SetupWizard {
         ];
         let cross_choice = select_one("Cross-region:", cross_options).map_err(SetupError::Io)?;
 
-        let cross_region = match cross_choice {
-            0 => Some("us".to_string()),
-            1 => Some("global".to_string()),
-            2 => Some("eu".to_string()),
-            3 => Some("apac".to_string()),
-            4 => None,
-            _ => None,
-        };
-        self.settings.bedrock_cross_region = cross_region;
-
-        let region = self
+        let bedrock = self
             .settings
-            .bedrock_region
-            .as_deref()
-            .unwrap_or("us-east-1");
+            .llm_builtin_overrides
+            .entry("bedrock".to_string())
+            .or_default();
+        match cross_choice {
+            0 => bedrock.set_extra("cross_region", "us"),
+            1 => bedrock.set_extra("cross_region", "global"),
+            2 => bedrock.set_extra("cross_region", "eu"),
+            3 => bedrock.set_extra("cross_region", "apac"),
+            _ => bedrock.set_extra("cross_region", ""),
+        }
+
+        let region = bedrock
+            .extra("region")
+            .unwrap_or(ironclaw_llm::BedrockConfig::DEFAULT_REGION);
         print_success(&format!("AWS Bedrock configured (region: {})", region));
         Ok(())
     }
@@ -4412,20 +4357,30 @@ mod tests {
     }
 
     /// Regression: switching from another provider to bedrock must clear
-    /// selected_model, and choosing "default credentials" must clear
-    /// bedrock_profile.
+    /// selected_model, and choosing "default credentials" must clear the
+    /// bedrock profile setting.
     #[test]
     fn test_bedrock_clears_stale_profile_on_default_creds() {
         let mut wizard = SetupWizard::new();
         wizard.settings.llm_backend = Some("bedrock".to_string());
-        wizard.settings.bedrock_profile = Some("old-sso-profile".to_string());
+        let bedrock = wizard
+            .settings
+            .llm_builtin_overrides
+            .entry("bedrock".to_string())
+            .or_default();
+        bedrock.set_extra("profile", "old-sso-profile");
 
         // Simulate auth_choice == 0 (default credentials) clearing the profile
-        wizard.settings.bedrock_profile = None;
+        let bedrock = wizard
+            .settings
+            .llm_builtin_overrides
+            .get_mut("bedrock")
+            .expect("bedrock entry");
+        bedrock.set_extra("profile", "");
 
         assert!(
-            wizard.settings.bedrock_profile.is_none(),
-            "bedrock_profile should be cleared when selecting default credentials"
+            bedrock.extra("profile").is_none(),
+            "bedrock profile should be cleared when selecting default credentials"
         );
     }
 
@@ -4434,20 +4389,65 @@ mod tests {
     #[test]
     fn test_bedrock_empty_profile_clears_existing() {
         let mut wizard = SetupWizard::new();
-        wizard.settings.bedrock_profile = Some("old-profile".to_string());
+        let bedrock = wizard
+            .settings
+            .llm_builtin_overrides
+            .entry("bedrock".to_string())
+            .or_default();
+        bedrock.set_extra("profile", "old-profile");
 
         // Simulate auth_choice == 1 with empty input
         let profile = "".to_string();
+        let bedrock = wizard
+            .settings
+            .llm_builtin_overrides
+            .get_mut("bedrock")
+            .expect("bedrock entry");
         if profile.trim().is_empty() {
-            wizard.settings.bedrock_profile = None;
+            bedrock.set_extra("profile", "");
         } else {
-            wizard.settings.bedrock_profile = Some(profile);
+            bedrock.set_extra("profile", profile);
         }
 
         assert!(
-            wizard.settings.bedrock_profile.is_none(),
-            "empty profile input should clear existing bedrock_profile"
+            bedrock.extra("profile").is_none(),
+            "empty profile input should clear existing bedrock profile"
         );
+    }
+
+    /// Regression: legacy `bedrock_*` fields on disk must migrate into
+    /// `llm_builtin_overrides["bedrock"].extras` on `Settings::load_from`,
+    /// so existing users don't lose configuration when upgrading past
+    /// the Layer D refactor.
+    #[test]
+    fn legacy_bedrock_fields_migrate_into_extras_on_load() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let path = tmpdir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "llm_backend": "bedrock",
+                "bedrock_region": "eu-west-1",
+                "bedrock_cross_region": "eu",
+                "bedrock_profile": "prod-bedrock"
+            }"#,
+        )
+        .expect("write fixture");
+
+        let settings = crate::settings::Settings::load_from(&path);
+        let bedrock = settings
+            .llm_builtin_overrides
+            .get("bedrock")
+            .expect("bedrock entry must exist after migration");
+        assert_eq!(bedrock.extra("region"), Some("eu-west-1"));
+        assert_eq!(bedrock.extra("cross_region"), Some("eu"));
+        assert_eq!(bedrock.extra("profile"), Some("prod-bedrock"));
+        assert!(
+            settings.bedrock_region.is_none(),
+            "named bedrock_region must be drained by the migration"
+        );
+        assert!(settings.bedrock_cross_region.is_none());
+        assert!(settings.bedrock_profile.is_none());
     }
 
     #[tokio::test]

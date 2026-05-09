@@ -249,19 +249,35 @@ pub async fn settings_set_handler(
 /// Keep this list narrow: every key added here causes an extra
 /// `Config::from_db_with_toml` round-trip plus a chain rebuild (retry, cache,
 /// circuit breaker wrappers), so non-LLM settings must not be listed.
+///
+/// Both exact-match keys and dotted-path subpaths under
+/// `llm_builtin_overrides.*` and `llm_custom_providers.*` trigger the
+/// reload — Layer D moved bedrock-specific settings into
+/// `llm_builtin_overrides["bedrock"].extras`, so a write to e.g.
+/// `llm_builtin_overrides.bedrock.extras.region` must also rebuild the
+/// chain.
 fn llm_setting_requires_reload(key: &str) -> bool {
-    matches!(
-        key,
-        "llm_backend"
-            | "selected_model"
-            | "llm_custom_providers"
-            | "llm_builtin_overrides"
-            | "ollama_base_url"
-            | "openai_compatible_base_url"
-            | "bedrock_region"
-            | "bedrock_cross_region"
-            | "bedrock_profile"
-    )
+    const EXACT: &[&str] = &[
+        "llm_backend",
+        "selected_model",
+        "llm_custom_providers",
+        "llm_builtin_overrides",
+        "ollama_base_url",
+        "openai_compatible_base_url",
+        // Legacy bedrock keys retained for backward-compat with
+        // settings.json files written before Layer D. New code writes to
+        // `llm_builtin_overrides.bedrock.extras.*` instead.
+        "bedrock_region",
+        "bedrock_cross_region",
+        "bedrock_profile",
+    ];
+    const PREFIX: &[&str] = &["llm_builtin_overrides", "llm_custom_providers"];
+    if EXACT.contains(&key) {
+        return true;
+    }
+    PREFIX.iter().any(|root| {
+        key.len() > root.len() + 1 && key.starts_with(root) && key.as_bytes()[root.len()] == b'.'
+    })
 }
 
 /// True when writes to `effective_user_id` actually feed the global provider

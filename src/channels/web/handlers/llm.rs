@@ -404,42 +404,13 @@ fn build_llm_providers(nearai_has_session_token: bool) -> serde_json::Value {
 
     let mut providers = Vec::new();
 
-    // NEAR AI is not in the registry — add it as a special case.
-    {
-        let mut entry = serde_json::Map::new();
-        entry.insert("id".into(), "nearai".into());
-        entry.insert("name".into(), "NEAR AI".into());
-        entry.insert("adapter".into(), "nearai".into());
-        entry.insert("base_url".into(), "https://cloud-api.near.ai/v1".into());
-        entry.insert("builtin".into(), true.into());
-        entry.insert(
-            "default_model".into(),
-            serde_json::Value::String(ironclaw_llm::DEFAULT_MODEL.to_string()),
-        );
-        entry.insert("api_key_required".into(), true.into());
-        entry.insert("base_url_required".into(), false.into());
-        entry.insert("can_list_models".into(), true.into());
-        // Env defaults — true if either an env API key OR a loaded session
-        // token is present; the frontend treats either as "credentials
-        // configured" because both reach NEAR AI as `Bearer <token>`.
-        entry.insert(
-            "has_api_key".into(),
-            (read_env("NEARAI_API_KEY").is_some() || nearai_has_session_token).into(),
-        );
-        if let Some(model) = read_env("NEARAI_MODEL") {
-            entry.insert("env_model".into(), serde_json::Value::String(model));
-        }
-        if let Some(url) = read_env("NEARAI_BASE_URL") {
-            entry.insert("env_base_url".into(), serde_json::Value::String(url));
-        }
-        providers.push(serde_json::Value::Object(entry));
-    }
-
-    // Registry-based providers
+    // Single registry-driven loop. NEAR AI / Bedrock / OpenAI Codex /
+    // Gemini OAuth are now first-class registry entries (Layer B), so
+    // the synthetic per-backend blocks that used to live here are gone.
     for def in registry.all() {
         let mut entry = serde_json::Map::new();
         entry.insert("id".into(), serde_json::Value::String(def.id.clone()));
-        // Use display_name from setup hint, falling back to titlecased id.
+        // Use display_name from setup hint, falling back to the id.
         let name = def
             .setup
             .as_ref()
@@ -465,10 +436,19 @@ fn build_llm_providers(nearai_has_session_token: bool) -> serde_json::Value {
         entry.insert("base_url_required".into(), def.base_url_required.into());
         let can_list = def.setup.as_ref().is_some_and(|s| s.can_list_models());
         entry.insert("can_list_models".into(), can_list.into());
-        // Env defaults
-        if let Some(ref api_key_env) = def.api_key_env {
-            entry.insert("has_api_key".into(), read_env(api_key_env).is_some().into());
+
+        // Env defaults / has_api_key. NEAR AI is "configured" if either
+        // its API key env is set OR a session token has been loaded —
+        // both reach the API as `Bearer <token>`.
+        let mut has_api_key = def
+            .api_key_env
+            .as_ref()
+            .is_some_and(|env| read_env(env).is_some());
+        if def.id == "nearai" && nearai_has_session_token {
+            has_api_key = true;
         }
+        entry.insert("has_api_key".into(), has_api_key.into());
+
         if let Some(model) = read_env(&def.model_env) {
             entry.insert("env_model".into(), serde_json::Value::String(model));
         }
@@ -477,24 +457,6 @@ fn build_llm_providers(nearai_has_session_token: bool) -> serde_json::Value {
         {
             entry.insert("env_base_url".into(), serde_json::Value::String(url));
         }
-        providers.push(serde_json::Value::Object(entry));
-    }
-
-    // Bedrock is not in the registry — add it as a special case.
-    {
-        let mut entry = serde_json::Map::new();
-        entry.insert("id".into(), "bedrock".into());
-        entry.insert("name".into(), "AWS Bedrock".into());
-        entry.insert("adapter".into(), "bedrock".into());
-        entry.insert("base_url".into(), "".into());
-        entry.insert("builtin".into(), true.into());
-        entry.insert(
-            "default_model".into(),
-            "anthropic.claude-3-sonnet-20240229-v1:0".into(),
-        );
-        entry.insert("api_key_required".into(), false.into());
-        entry.insert("base_url_required".into(), false.into());
-        entry.insert("can_list_models".into(), false.into());
         providers.push(serde_json::Value::Object(entry));
     }
 

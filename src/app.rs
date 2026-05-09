@@ -1122,14 +1122,16 @@ impl AppBuilder {
         self.init_database().await?;
         self.init_secrets().await?;
 
-        // Post-init validation: backends with dedicated config (nearai, gemini_oauth,
-        // bedrock, openai_codex) handle their own credential resolution. For registry-based
-        // backends, fail early if no provider config was resolved.
-        if !matches!(
-            self.config.llm.backend.as_str(),
-            "nearai" | "gemini_oauth" | "bedrock" | "openai_codex"
-        ) && self.config.llm.provider.is_none()
-        {
+        // Post-init validation: backends with a dedicated config slot
+        // (nearai/gemini_oauth/bedrock/openai_codex) read from their own
+        // sub-struct and don't populate `LlmConfig.provider`. For
+        // OpenAI-shape registry backends, fail early if no provider
+        // config was resolved.
+        let registry = ironclaw_llm::ProviderRegistry::load();
+        let has_dedicated_config = registry
+            .find(self.config.llm.backend.as_str())
+            .is_some_and(|d| d.protocol.has_dedicated_config());
+        if !has_dedicated_config && self.config.llm.provider.is_none() {
             let backend = &self.config.llm.backend;
             anyhow::bail!(
                 "LLM_BACKEND={backend} is configured but no credentials were found. \

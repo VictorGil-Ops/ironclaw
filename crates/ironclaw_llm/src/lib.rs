@@ -56,7 +56,7 @@ pub use config::{
     BedrockConfig, CacheRetention, GeminiOauthConfig, LlmConfig, NearAiConfig, OAUTH_PLACEHOLDER,
     OpenAiCodexConfig, RegistryProviderConfig,
 };
-pub use error::LlmError;
+pub use error::{LlmConfigError, LlmError};
 pub use failover::{CooldownConfig, FailoverProvider};
 pub(crate) use gemini_oauth::GeminiOauthProvider;
 pub use host::{
@@ -210,6 +210,22 @@ fn create_registry_provider(
             );
             Ok(Arc::new(provider))
         }
+        // Protocols with a dedicated config slot on `LlmConfig` are
+        // dispatched in `create_llm_provider` before this function is
+        // reached. They never carry a `RegistryProviderConfig`, so this
+        // arm is only reachable as an internal logic bug.
+        ProviderProtocol::Bedrock
+        | ProviderProtocol::OpenAiCodex
+        | ProviderProtocol::GeminiOauth
+        | ProviderProtocol::NearAi => Err(LlmError::RequestFailed {
+            provider: config.provider_id.clone(),
+            reason: format!(
+                "Provider '{}' uses a dedicated config slot on LlmConfig and \
+                 must be dispatched in create_llm_provider, not via \
+                 RegistryProviderConfig.",
+                config.provider_id
+            ),
+        }),
     }
 }
 

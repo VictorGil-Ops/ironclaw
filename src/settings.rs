@@ -69,6 +69,39 @@ pub struct LlmBuiltinOverride {
     /// Base URL override. Takes precedence over environment variables.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// Per-provider settings bag for non-OpenAI-shape backends that need
+    /// extra fields beyond api_key / model / base_url. Example keys:
+    ///
+    /// - `bedrock`: `region`, `cross_region`, `profile`
+    /// - `gemini_oauth`: `credentials_path`
+    /// - `openai_codex`: (none today; reserved)
+    ///
+    /// Settings flow into this bag through the wizard's generic
+    /// `SetupHint` dispatch (Layer C); the binary-side resolver in
+    /// `crate::config::llm::resolve` reads them when assembling the
+    /// per-provider config struct.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub extras: HashMap<String, String>,
+}
+
+impl LlmBuiltinOverride {
+    /// Look up an extras-bag field by key; returns `None` if absent or empty.
+    pub fn extra(&self, key: &str) -> Option<&str> {
+        self.extras
+            .get(key)
+            .map(|s| s.as_str())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Set an extras-bag field; clears the entry when `value` is empty.
+    pub fn set_extra(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        let v = value.into();
+        if v.is_empty() {
+            self.extras.remove(&key.into());
+        } else {
+            self.extras.insert(key.into(), v);
+        }
+    }
 }
 
 impl std::fmt::Debug for LlmBuiltinOverride {
@@ -77,6 +110,7 @@ impl std::fmt::Debug for LlmBuiltinOverride {
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
             .field("model", &self.model)
             .field("base_url", &self.base_url)
+            .field("extras", &self.extras)
             .finish()
     }
 }
@@ -157,16 +191,23 @@ pub struct Settings {
     #[serde(default)]
     pub openai_compatible_base_url: Option<String>,
 
-    /// Bedrock region (when llm_backend = "bedrock").
-    #[serde(default)]
+    /// **Deprecated.** Bedrock region — moved to
+    /// `llm_builtin_overrides["bedrock"].extras["region"]` in Layer D.
+    /// Existing values are migrated on load via
+    /// [`Settings::migrate_legacy_provider_fields`]; new code must read
+    /// from / write to the extras bag instead. Kept for one release so
+    /// users upgrading from older settings.json files don't lose data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bedrock_region: Option<String>,
 
-    /// Bedrock cross-region inference prefix (when llm_backend = "bedrock").
-    #[serde(default)]
+    /// **Deprecated.** Bedrock cross-region inference prefix — moved to
+    /// `llm_builtin_overrides["bedrock"].extras["cross_region"]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bedrock_cross_region: Option<String>,
 
-    /// AWS profile name for Bedrock (when llm_backend = "bedrock").
-    #[serde(default)]
+    /// **Deprecated.** AWS profile name for Bedrock — moved to
+    /// `llm_builtin_overrides["bedrock"].extras["profile"]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bedrock_profile: Option<String>,
 
     // === Step 4: Model Selection ===
@@ -1150,9 +1191,45 @@ impl Settings {
 
     /// Load settings from a specific path (used by bootstrap legacy migration).
     pub fn load_from(path: &std::path::Path) -> Self {
-        match std::fs::read_to_string(path) {
+        let mut settings: Self = match std::fs::read_to_string(path) {
             Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
             Err(_) => Self::default(),
+        };
+        settings.migrate_legacy_provider_fields();
+        settings
+    }
+
+    /// Move legacy named per-provider fields into the generic
+    /// `llm_builtin_overrides[<id>].extras` bag.
+    ///
+    /// Layer D moved bedrock-specific config out of named columns
+    /// (`bedrock_region`, `bedrock_cross_region`, `bedrock_profile`) and
+    /// into a per-provider settings bag so adding a new non-OpenAI-shape
+    /// backend doesn't require new `Settings` columns. Old persisted
+    /// settings.json / config.toml files still carry the named fields;
+    /// this helper folds them into `extras` once on load and clears the
+    /// originals so subsequent saves write only the new shape.
+    ///
+    /// Idempotent: re-runs are no-ops because the named fields are
+    /// `take()`-drained.
+    pub fn migrate_legacy_provider_fields(&mut self) {
+        let region = self.bedrock_region.take();
+        let cross_region = self.bedrock_cross_region.take();
+        let profile = self.bedrock_profile.take();
+        if region.is_some() || cross_region.is_some() || profile.is_some() {
+            let entry = self
+                .llm_builtin_overrides
+                .entry("bedrock".to_string())
+                .or_default();
+            if let Some(v) = region {
+                entry.set_extra("region", v);
+            }
+            if let Some(v) = cross_region {
+                entry.set_extra("cross_region", v);
+            }
+            if let Some(v) = profile {
+                entry.set_extra("profile", v);
+            }
         }
     }
 
@@ -2861,6 +2938,7 @@ mod tests {
             api_key: Some("sk-secret-123".to_string()),
             model: Some("gpt-4".to_string()),
             base_url: None,
+            extras: Default::default(),
         };
         let debug_output = format!("{:?}", override_val);
         assert!(
