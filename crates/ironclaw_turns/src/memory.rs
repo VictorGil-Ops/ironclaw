@@ -1107,6 +1107,8 @@ impl Inner {
             if record.scope != request.scope {
                 return Err(TurnError::ScopeNotFound);
             }
+            // BlockedProcess is not resumable via gate resolution — process
+            // blocks resume through a separate process-completion mechanism.
             if !matches!(
                 record.status,
                 TurnStatus::BlockedApproval | TurnStatus::BlockedAuth | TurnStatus::BlockedResource
@@ -1163,6 +1165,7 @@ impl Inner {
                 | TurnStatus::BlockedApproval
                 | TurnStatus::BlockedAuth
                 | TurnStatus::BlockedResource
+                | TurnStatus::BlockedProcess
                 | TurnStatus::RecoveryRequired => (TurnStatus::Cancelled, TurnEventKind::Cancelled),
                 TurnStatus::Running | TurnStatus::CancelRequested => {
                     (TurnStatus::CancelRequested, TurnEventKind::CancelRequested)
